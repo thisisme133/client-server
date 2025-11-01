@@ -12,14 +12,18 @@ typedef enum {
     PKT_MESSAGE = 4,
     PKT_DATA = 5,
     PKT_ACK = 6,
-    PKT_ERROR = 7
+    PKT_ERROR = 7,
+    PKT_HEARTBEAT = 8,
+    PKT_CHALLENGE = 9,
+    PKT_SESSION_KEY = 10
 } packet_type_t;
 
-/* Header de packet compact - 4 bytes total */
+/* Header de packet avec CRC - 8 bytes total */
 typedef struct __attribute__((packed)) {
     uint8_t type;        /* Type de packet */
     uint8_t flags;       /* Flags (compressed, encrypted, etc.) */
     uint16_t length;     /* Longueur des données */
+    uint32_t crc;        /* CRC32 pour intégrité */
 } packet_header_t;
 
 /* Taille maximale d'un packet */
@@ -60,6 +64,19 @@ typedef struct __attribute__((packed)) {
     uint8_t error_code;
     char error_msg[127];
 } payload_error_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t sequence;
+    uint32_t challenge_response;
+} payload_heartbeat_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t challenge;
+} payload_challenge_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t key[32];
+} payload_session_key_t;
 
 /* Fonctions de création de packets */
 void pkt_init(packet_t* pkt, uint8_t type);

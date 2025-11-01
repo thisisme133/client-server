@@ -1,35 +1,45 @@
 #include "network.h"
 #include "packet.h"
 #include "compression.h"
+#include "crc.h"
+#include "crypto.h"
+#include "logger.h"
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+
+#ifdef _WIN32
+    #include <windows.h>
+#else
+    #include <unistd.h>
+    #include <sys/time.h>
+#endif
 
 #define SERVER_IP "127.0.0.1"
 #define SERVER_PORT 8888
 #define BUFFER_SIZE 2048
+#define HEARTBEAT_INTERVAL 5  /* 5 secondes */
 
 static socket_t client_socket = INVALID_SOCKET_VALUE;
 static uint8_t connected = 0;
+static uint8_t authenticated = 0;
+static uint8_t session_key[SESSION_KEY_SIZE];
+static uint32_t current_challenge = 0;
+static uint32_t heartbeat_sequence = 0;
+static time_t last_heartbeat = 0;
 
-/* Forward declarations des handlers */
-static void handle_connect_response(void);
-static void handle_disconnect_response(void);
+/* Prototypes */
 static void handle_packet(packet_t* pkt);
-
-/* Handlers spécifiques par type de packet */
-static void handle_ack(packet_t* pkt);
-static void handle_pong(packet_t* pkt);
-static void handle_message(packet_t* pkt);
-static void handle_error(packet_t* pkt);
-
-/* Utilitaires */
-static void send_packet(packet_t* pkt);
-static void send_ping(void);
-static void send_message(const char* msg);
-static void send_data(const uint8_t* data, uint16_t size);
+static void send_packet(packet_t* pkt, uint8_t encrypt);
+static void send_heartbeat(void);
+static void send_connect(void);
 
 int main(void) {
-    printf("TCP Client - Starting...\n");
+    printf("═══════════════════════════════════════════════════════════\n");
+    printf("    TCP Client with Heartbeat Authentication\n");
+    printf("═══════════════════════════════════════════════════════════\n\n");
+
+    logger_init();
 
     /* Initialiser réseau */
     if (net_init() != 0) {
@@ -46,44 +56,42 @@ int main(void) {
     }
 
     /* Connecter au serveur */
-    printf("Connecting to %s:%d...\n", SERVER_IP, SERVER_PORT);
+    printf("→ Connecting to %s:%d...\n", SERVER_IP, SERVER_PORT);
     if (net_connect(client_socket, SERVER_IP, SERVER_PORT) != 0) {
-        printf("Error: Failed to connect to server\n");
+        printf("✗ Failed to connect to server\n");
         net_close_socket(client_socket);
         net_cleanup();
         return 1;
     }
 
-    printf("Connected to server!\n");
+    printf("✓ Connected to server\n\n");
     connected = 1;
-    handle_connect_response();
 
     /* Configuration non-blocking */
     net_set_nonblocking(client_socket);
 
-    /* Envoyer packet de connexion */
-    packet_t connect_pkt;
-    pkt_init(&connect_pkt, PKT_CONNECT);
-    payload_connect_t connect_payload;
-    connect_payload.timestamp = 0;
-    connect_payload.client_id = 1;
-    pkt_set_payload(&connect_pkt, &connect_payload, sizeof(payload_connect_t));
-    send_packet(&connect_pkt);
-
     /* Boucle principale */
     uint8_t buffer[BUFFER_SIZE];
-    uint32_t ping_counter = 0;
+    uint32_t test_message_counter = 0;
 
     while (connected) {
         /* Recevoir données */
         int32_t received = net_recv(client_socket, buffer, BUFFER_SIZE);
 
         if (received > 0) {
-            /* Désérialiser et traiter le packet */
+            /* Désérialiser packet */
             packet_t pkt;
             uint16_t consumed = pkt_deserialize(&pkt, buffer, received);
 
             if (consumed > 0) {
+                log_packet(LOG_RECV, &pkt, "Server");
+
+                /* Déchiffrer si nécessaire */
+                if (pkt_has_flag(&pkt, PKT_FLAG_ENCRYPTED) && authenticated) {
+                    crypto_decrypt(session_key, pkt.payload, pkt.payload, pkt.header.length);
+                    pkt.header.flags &= ~PKT_FLAG_ENCRYPTED;
+                }
+
                 /* Décompresser si nécessaire */
                 if (pkt_has_flag(&pkt, PKT_FLAG_COMPRESSED)) {
                     uint8_t decompressed[MAX_PAYLOAD_SIZE];
@@ -96,34 +104,43 @@ int main(void) {
                 }
 
                 handle_packet(&pkt);
+            } else {
+                printf("✗ Invalid packet (CRC fail or malformed)\n");
             }
         } else if (received == 0) {
-            /* Connexion fermée */
-            printf("Server closed connection\n");
-            handle_disconnect_response();
+            printf("← Server closed connection\n");
             connected = 0;
             break;
         } else if (!net_would_block()) {
-            /* Erreur */
-            printf("Connection error\n");
-            handle_disconnect_response();
+            printf("✗ Connection error\n");
             connected = 0;
             break;
         }
 
-        /* Envoyer un ping toutes les 100 itérations */
-        ping_counter++;
-        if (ping_counter >= 100) {
-            ping_counter = 0;
-            send_ping();
-        }
+        /* Envoyer heartbeat si nécessaire */
+        if (authenticated) {
+            time_t now = time(NULL);
+            if (difftime(now, last_heartbeat) >= HEARTBEAT_INTERVAL) {
+                send_heartbeat();
+                last_heartbeat = now;
+            }
 
-        /* Test: envoyer un message toutes les 200 itérations */
-        static uint32_t msg_counter = 0;
-        msg_counter++;
-        if (msg_counter >= 200) {
-            msg_counter = 0;
-            send_message("Hello from client!");
+            /* Test: envoyer un message toutes les 10 secondes */
+            test_message_counter++;
+            if (test_message_counter >= 1000) {  /* ~10 secondes avec sleep de 10ms */
+                test_message_counter = 0;
+
+                packet_t msg_pkt;
+                pkt_init(&msg_pkt, PKT_MESSAGE);
+
+                payload_message_t msg;
+                const char* text = "Hello from client!";
+                msg.msg_len = strlen(text);
+                memcpy(msg.message, text, msg.msg_len);
+
+                pkt_set_payload(&msg_pkt, &msg, sizeof(uint16_t) + msg.msg_len);
+                send_packet(&msg_pkt, 1);
+            }
         }
 
 #ifdef _WIN32
@@ -141,81 +158,87 @@ int main(void) {
         payload_disconnect_t disconnect_payload;
         disconnect_payload.reason = 0;
         pkt_set_payload(&disconnect_pkt, &disconnect_payload, sizeof(payload_disconnect_t));
-        send_packet(&disconnect_pkt);
+        send_packet(&disconnect_pkt, 0);
 
         net_close_socket(client_socket);
     }
     net_cleanup();
 
-    printf("Client stopped\n");
+    printf("\n✓ Client stopped\n");
     return 0;
 }
 
-static void handle_connect_response(void) {
-    printf("Connection established\n");
-}
-
-static void handle_disconnect_response(void) {
-    printf("Disconnected from server\n");
-}
-
 static void handle_packet(packet_t* pkt) {
-    /* Switch case pour router vers les handlers spécifiques */
     switch (pkt_get_type(pkt)) {
-        case PKT_ACK:
-            handle_ack(pkt);
-            break;
+        case PKT_CHALLENGE: {
+            payload_challenge_t ch;
+            uint16_t size;
+            pkt_get_payload(pkt, &ch, &size);
 
-        case PKT_PONG:
-            handle_pong(pkt);
+            printf("→ Received challenge: 0x%08X\n", ch.challenge);
+            current_challenge = ch.challenge;
             break;
+        }
 
-        case PKT_MESSAGE:
-            handle_message(pkt);
+        case PKT_SESSION_KEY: {
+            payload_session_key_t sk;
+            uint16_t size;
+            pkt_get_payload(pkt, &sk, &size);
+
+            memcpy(session_key, sk.key, SESSION_KEY_SIZE);
+            printf("✓ Received session key\n");
+
+            /* Maintenant s'authentifier */
+            send_connect();
             break;
+        }
 
-        case PKT_ERROR:
-            handle_error(pkt);
+        case PKT_ACK: {
+            if (!authenticated) {
+                printf("✓ Authenticated with server\n");
+                authenticated = 1;
+                last_heartbeat = time(NULL);
+            }
             break;
+        }
 
-        case PKT_DISCONNECT:
-            printf("Server requested disconnect\n");
+        case PKT_PONG: {
+            printf("← PONG received\n");
+            break;
+        }
+
+        case PKT_MESSAGE: {
+            payload_message_t msg;
+            uint16_t size;
+            pkt_get_payload(pkt, &msg, &size);
+
+            printf("← Message echoed: \"%.*s\"\n", msg.msg_len, msg.message);
+            break;
+        }
+
+        case PKT_ERROR: {
+            payload_error_t error;
+            uint16_t size;
+            pkt_get_payload(pkt, &error, &size);
+
+            printf("✗ Error [%d]: %s\n", error.error_code, error.error_msg);
             connected = 0;
             break;
+        }
+
+        case PKT_DISCONNECT: {
+            printf("← Server requested disconnect\n");
+            connected = 0;
+            break;
+        }
 
         default:
-            printf("Unknown packet type: %d\n", pkt_get_type(pkt));
+            printf("← Unknown packet type: %d\n", pkt_get_type(pkt));
             break;
     }
 }
 
-static void handle_ack(packet_t* pkt) {
-    (void)pkt;  /* Paramètre non utilisé */
-    printf("Received: ACK\n");
-}
-
-static void handle_pong(packet_t* pkt) {
-    (void)pkt;  /* Paramètre non utilisé */
-    printf("Received: PONG\n");
-}
-
-static void handle_message(packet_t* pkt) {
-    payload_message_t msg;
-    uint16_t size;
-    pkt_get_payload(pkt, &msg, &size);
-
-    printf("Received: MESSAGE [%.*s]\n", msg.msg_len, msg.message);
-}
-
-static void handle_error(packet_t* pkt) {
-    payload_error_t error;
-    uint16_t size;
-    pkt_get_payload(pkt, &error, &size);
-
-    printf("Received: ERROR [%d] %s\n", error.error_code, error.error_msg);
-}
-
-static void send_packet(packet_t* pkt) {
+static void send_packet(packet_t* pkt, uint8_t encrypt) {
     if (!connected || client_socket == INVALID_SOCKET_VALUE) return;
 
     /* Compresser si bénéfique */
@@ -232,50 +255,45 @@ static void send_packet(packet_t* pkt) {
         }
     }
 
+    /* Chiffrer si demandé et authentifié */
+    if (encrypt && authenticated) {
+        crypto_encrypt(session_key, pkt->payload, pkt->payload, pkt->header.length);
+        pkt_set_flag(pkt, PKT_FLAG_ENCRYPTED);
+    }
+
     /* Sérialiser et envoyer */
     uint8_t buffer[MAX_PACKET_SIZE];
     uint16_t size = pkt_serialize(pkt, buffer);
+
+    log_packet(LOG_SEND, pkt, "Server");
+
     net_send(client_socket, buffer, size);
 }
 
-static void send_ping(void) {
-    printf("Sending: PING\n");
+static void send_heartbeat(void) {
+    printf("→ Sending heartbeat #%u\n", heartbeat_sequence);
+
     packet_t pkt;
-    pkt_init(&pkt, PKT_PING);
-    send_packet(&pkt);
+    pkt_init(&pkt, PKT_HEARTBEAT);
+
+    payload_heartbeat_t payload;
+    payload.sequence = heartbeat_sequence++;
+    payload.challenge_response = crypto_solve_challenge(current_challenge);
+
+    pkt_set_payload(&pkt, &payload, sizeof(payload));
+    send_packet(&pkt, 1);
 }
 
-static void send_message(const char* msg) {
-    printf("Sending: MESSAGE [%s]\n", msg);
+static void send_connect(void) {
+    printf("→ Requesting authentication\n");
 
     packet_t pkt;
-    pkt_init(&pkt, PKT_MESSAGE);
+    pkt_init(&pkt, PKT_CONNECT);
 
-    payload_message_t payload;
-    payload.msg_len = strlen(msg);
-    if (payload.msg_len > sizeof(payload.message)) {
-        payload.msg_len = sizeof(payload.message);
-    }
-    memcpy(payload.message, msg, payload.msg_len);
+    payload_connect_t payload;
+    payload.timestamp = (uint32_t)time(NULL);
+    payload.client_id = 1;
 
-    pkt_set_payload(&pkt, &payload, sizeof(uint16_t) + payload.msg_len);
-    send_packet(&pkt);
-}
-
-static void send_data(const uint8_t* data, uint16_t size) __attribute__((unused));
-static void send_data(const uint8_t* data, uint16_t size) {
-    printf("Sending: DATA (%d bytes)\n", size);
-
-    packet_t pkt;
-    pkt_init(&pkt, PKT_DATA);
-
-    payload_data_t payload;
-    payload.data_len = size;
-    if (payload.data_len > sizeof(payload.data)) {
-        payload.data_len = sizeof(payload.data);
-    }
-    memcpy(payload.data, data, payload.data_len);
-
-    pkt_set_payload(&pkt, &payload, sizeof(uint16_t) + payload.data_len);
-    send_packet(&pkt);
+    pkt_set_payload(&pkt, &payload, sizeof(payload));
+    send_packet(&pkt, 0);
 }

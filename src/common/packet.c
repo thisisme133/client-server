@@ -1,4 +1,5 @@
 #include "packet.h"
+#include "crc.h"
 #include <string.h>
 
 void pkt_init(packet_t* pkt, uint8_t type) {
@@ -6,6 +7,7 @@ void pkt_init(packet_t* pkt, uint8_t type) {
     pkt->header.type = type;
     pkt->header.flags = 0;
     pkt->header.length = 0;
+    pkt->header.crc = 0;
 }
 
 void pkt_set_payload(packet_t* pkt, const void* data, uint16_t size) {
@@ -26,14 +28,27 @@ void pkt_get_payload(const packet_t* pkt, void* data, uint16_t* size) {
 }
 
 uint16_t pkt_serialize(const packet_t* pkt, uint8_t* buffer) {
-    uint16_t total_size = sizeof(packet_header_t) + pkt->header.length;
+    packet_t temp_pkt;
+    memcpy(&temp_pkt, pkt, sizeof(packet_t));
 
-    /* Copier header */
-    memcpy(buffer, &pkt->header, sizeof(packet_header_t));
+    /* Calculer CRC sur header (sans CRC) + payload */
+    uint8_t crc_buffer[MAX_PACKET_SIZE];
+    uint16_t crc_size = sizeof(packet_header_t) - sizeof(uint32_t) + temp_pkt.header.length;
 
-    /* Copier payload */
-    if (pkt->header.length > 0) {
-        memcpy(buffer + sizeof(packet_header_t), pkt->payload, pkt->header.length);
+    memcpy(crc_buffer, &temp_pkt.header, sizeof(packet_header_t) - sizeof(uint32_t));
+    if (temp_pkt.header.length > 0) {
+        memcpy(crc_buffer + sizeof(packet_header_t) - sizeof(uint32_t),
+               temp_pkt.payload, temp_pkt.header.length);
+    }
+
+    temp_pkt.header.crc = crc32_calculate(crc_buffer, crc_size);
+
+    /* Copier dans le buffer de sortie */
+    uint16_t total_size = sizeof(packet_header_t) + temp_pkt.header.length;
+    memcpy(buffer, &temp_pkt.header, sizeof(packet_header_t));
+
+    if (temp_pkt.header.length > 0) {
+        memcpy(buffer + sizeof(packet_header_t), temp_pkt.payload, temp_pkt.header.length);
     }
 
     return total_size;
@@ -60,6 +75,20 @@ uint16_t pkt_deserialize(packet_t* pkt, const uint8_t* buffer, uint16_t buffer_s
     /* Lire payload */
     if (pkt->header.length > 0) {
         memcpy(pkt->payload, buffer + sizeof(packet_header_t), pkt->header.length);
+    }
+
+    /* Vérifier CRC */
+    uint8_t crc_buffer[MAX_PACKET_SIZE];
+    uint16_t crc_size = sizeof(packet_header_t) - sizeof(uint32_t) + pkt->header.length;
+
+    memcpy(crc_buffer, &pkt->header, sizeof(packet_header_t) - sizeof(uint32_t));
+    if (pkt->header.length > 0) {
+        memcpy(crc_buffer + sizeof(packet_header_t) - sizeof(uint32_t),
+               pkt->payload, pkt->header.length);
+    }
+
+    if (!crc32_verify(crc_buffer, crc_size, pkt->header.crc)) {
+        return 0;  /* CRC invalide */
     }
 
     return total_size;

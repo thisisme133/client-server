@@ -34,6 +34,9 @@ add_library(common STATIC
     src/common/network.c
     src/common/packet.c
     src/common/compression.c
+    src/common/crc.c
+    src/common/crypto.c
+    src/common/logger.c
 )
 
 # Server executable
@@ -52,6 +55,11 @@ target_link_libraries(client common)
 if(WIN32)
     target_link_libraries(server ws2_32)
     target_link_libraries(client ws2_32)
+else()
+    # POSIX threads pour Linux/macOS
+    find_package(Threads REQUIRED)
+    target_link_libraries(server ${CMAKE_THREAD_LIBS_INIT})
+    target_link_libraries(client ${CMAKE_THREAD_LIBS_INIT})
 endif()
 
 # Strip les symboles en post-build
