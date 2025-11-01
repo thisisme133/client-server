@@ -12,6 +12,7 @@
 
 #ifdef _WIN32
     #include <windows.h>
+    #include <tlhelp32.h>
 #else
     #include <unistd.h>
     #include <sys/time.h>
@@ -36,6 +37,11 @@ static uint8_t packet_logging_enabled = 1;
 static time_t last_ping_time = 0;
 static uint8_t waiting_for_pong = 0;
 
+/* Module list variables */
+#define MAX_MODULES 32
+static char available_modules[MAX_MODULES][128];
+static uint8_t module_count = 0;
+
 /* PE Loading variables */
 static uint32_t pe_image_size = 0;
 static uint32_t pe_entry_rva = 0;
@@ -45,9 +51,14 @@ static uint32_t pe_imports_received = 0;
 static void* pe_allocated_base = NULL;
 static uint8_t* pe_image_buffer = NULL;
 static uint32_t pe_image_received = 0;
-static uint32_t target_pid = 0;
-static char target_process_name[64] = {0};
 static uint8_t target_is_64bit = 0;
+
+/* Remote process injection variables */
+#ifdef _WIN32
+static HANDLE target_process_handle = NULL;
+static DWORD target_pid = 0;
+static char target_process_name[128] = {0};
+#endif
 
 /* Import entry structure for parsing */
 typedef struct {
@@ -65,6 +76,7 @@ static void send_heartbeat(void);
 static void send_connect(void);
 
 /* PE Loading handlers */
+static void handle_module_list(packet_t* pkt);
 static void handle_pe_metadata(packet_t* pkt);
 static void handle_pe_imports(packet_t* pkt);
 static void handle_pe_image(packet_t* pkt);
@@ -72,6 +84,11 @@ static void parse_imports_and_allocate(void);
 static void resolve_imports(void);
 static void execute_pe(void);
 static void send_game_select(uint32_t module_id);
+
+#ifdef _WIN32
+/* Process enumeration */
+static DWORD find_process_by_name(const char* process_name);
+#endif
 
 /* Command handlers */
 static void cmd_stop(const char* args);
@@ -133,22 +150,59 @@ static void cmd_load(const char* args) {
         return;
     }
 
-    /* Parser l'argument: module_id */
+#ifndef _WIN32
+    printf("\n✗ Manual mapping is only supported on Windows\n");
+    return;
+#else
+    /* Parser l'argument: module_id process_name */
     uint32_t module_id = 0;
+    char process_name[128] = {0};
 
     if (!args || strlen(args) == 0) {
-        printf("\nUsage: load <module_id>\n");
-        printf("  module_id: Module identifier (0, 1, 2, ...)\n");
-        printf("\nExample: load 0   (Load module 0)\n");
+        printf("\nUsage: load <module_id> <process_name>\n");
+        printf("  module_id:    Module identifier (0, 1, 2, ...)\n");
+        printf("  process_name: Target process executable name (e.g., notepad.exe)\n");
+        printf("\nExample: load 0 notepad.exe\n");
         return;
     }
 
-    if (sscanf(args, "%u", &module_id) != 1) {
-        printf("\n✗ Invalid arguments. Usage: load <module_id>\n");
+    if (sscanf(args, "%u %127s", &module_id, process_name) != 2) {
+        printf("\n✗ Invalid arguments. Usage: load <module_id> <process_name>\n");
         return;
     }
 
+    if (module_id >= module_count) {
+        printf("\n✗ Invalid module ID. Valid range: 0-%u\n", module_count - 1);
+        return;
+    }
+
+    /* Trouver le processus cible */
+    DWORD pid = find_process_by_name(process_name);
+    if (pid == 0) {
+        printf("\n✗ Process not found: %s\n", process_name);
+        printf("   Make sure the process is running\n");
+        return;
+    }
+
+    /* Ouvrir le processus */
+    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    if (!hProcess) {
+        printf("\n✗ Failed to open process (PID: %lu)\n", pid);
+        printf("   Error code: %lu\n", GetLastError());
+        printf("   Try running as Administrator\n");
+        return;
+    }
+
+    printf("✓ Opened process handle: 0x%p\n", hProcess);
+
+    /* Sauvegarder les informations du processus cible */
+    target_process_handle = hProcess;
+    target_pid = pid;
+    strncpy(target_process_name, process_name, sizeof(target_process_name) - 1);
+
+    /* Envoyer la sélection du module */
     send_game_select(module_id);
+#endif
 }
 
 int main(void) {
@@ -166,7 +220,7 @@ int main(void) {
     cmd_register("heartbeat", "Toggle heartbeat on/off", cmd_heartbeat);
     cmd_register("nolog", "Toggle packet logging on/off", cmd_nolog);
     cmd_register("status", "Show client status", cmd_status);
-    cmd_register("load", "Load and inject a DLL module (args: module_id)", cmd_load);
+    cmd_register("load", "Load and inject a DLL module (args: module_id process_name)", cmd_load);
 
     printf("Type 'help' for available commands\n\n");
     printf("> ");
@@ -353,6 +407,11 @@ static void handle_packet(packet_t* pkt) {
             break;
         }
 
+        case PKT_MODULE_LIST: {
+            handle_module_list(pkt);
+            break;
+        }
+
         case PKT_PE_METADATA: {
             handle_pe_metadata(pkt);
             break;
@@ -440,6 +499,58 @@ static void send_connect(void) {
    PE Loading Functions
    ============================================ */
 
+#ifdef _WIN32
+static DWORD find_process_by_name(const char* process_name) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        printf("✗ Failed to create process snapshot\n");
+        return 0;
+    }
+
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+
+    if (!Process32First(hSnapshot, &pe32)) {
+        CloseHandle(hSnapshot);
+        return 0;
+    }
+
+    DWORD found_pid = 0;
+    do {
+        if (_stricmp(pe32.szExeFile, process_name) == 0) {
+            found_pid = pe32.th32ProcessID;
+            printf("✓ Found process: %s (PID: %lu)\n", process_name, found_pid);
+            break;
+        }
+    } while (Process32Next(hSnapshot, &pe32));
+
+    CloseHandle(hSnapshot);
+    return found_pid;
+}
+#endif
+
+static void handle_module_list(packet_t* pkt) {
+    payload_module_list_t payload;
+    uint16_t size;
+    pkt_get_payload(pkt, &payload, &size);
+
+    module_count = payload.count;
+
+    printf("\n╔════════════════════════════════════════════════════════════╗\n");
+    printf("║              Available DLL Modules                         ║\n");
+    printf("╠════════════════════════════════════════════════════════════╣\n");
+
+    for (uint8_t i = 0; i < module_count && i < MAX_MODULES; i++) {
+        strncpy(available_modules[i], payload.modules[i], sizeof(available_modules[i]) - 1);
+        available_modules[i][sizeof(available_modules[i]) - 1] = '\0';
+        printf("║ [%2u] %-54s║\n", i, available_modules[i]);
+    }
+
+    printf("╚════════════════════════════════════════════════════════════╝\n");
+    printf("\nUse 'load <module_id>' to inject a module\n");
+    printf("Example: load 0\n\n");
+}
+
 static void send_game_select(uint32_t module_id) {
     printf("\n→ Requesting module %u\n", module_id);
 
@@ -461,13 +572,10 @@ static void handle_pe_metadata(packet_t* pkt) {
     pe_image_size = payload.image_size;
     pe_entry_rva = payload.entry_rva;
     pe_imports_size = payload.imports_size;
-    target_pid = payload.target_pid;
     target_is_64bit = payload.is_64bit;
-    strncpy(target_process_name, payload.process_name, sizeof(target_process_name) - 1);
 
     printf("← PE Metadata received:\n");
-    printf("   Target process: %s (PID %u, %s)\n",
-           target_process_name, target_pid, target_is_64bit ? "x64" : "x86");
+    printf("   DLL: %s (%s)\n", payload.dll_name, target_is_64bit ? "x64" : "x86");
     printf("   Image size:   %u bytes\n", pe_image_size);
     printf("   Entry RVA:    0x%08X\n", pe_entry_rva);
     printf("   Imports size: %u bytes\n", pe_imports_size);
@@ -576,24 +684,38 @@ static void parse_imports_and_allocate(void) {
 
     printf("✓ Imports parsed\n");
 
-    /* Allouer la mémoire pour l'image PE */
+    /* Allouer la mémoire pour l'image PE dans le processus DISTANT */
 #ifdef _WIN32
-    pe_allocated_base = VirtualAlloc(NULL, pe_image_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-#else
-    /* Sur Linux, on peut utiliser mmap mais pas d'exécution réelle */
-    pe_allocated_base = malloc(pe_image_size);
-#endif
-
-    if (!pe_allocated_base) {
-        printf("✗ Failed to allocate PE memory\n");
+    if (!target_process_handle) {
+        printf("✗ No target process handle\n");
         return;
     }
 
-    printf("✓ Allocated %u bytes at 0x%p\n", pe_image_size, pe_allocated_base);
+    /* Allouer dans le processus distant */
+    pe_allocated_base = VirtualAllocEx(target_process_handle, NULL, pe_image_size,
+                                       MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!pe_allocated_base) {
+        printf("✗ Failed to allocate PE memory in remote process\n");
+        printf("   Error code: %lu\n", GetLastError());
+        return;
+    }
 
-    /* Allouer le buffer pour recevoir l'image */
-    pe_image_buffer = (uint8_t*)pe_allocated_base;
+    printf("✓ Allocated %u bytes in remote process at 0x%p\n", pe_image_size, pe_allocated_base);
+
+    /* Allouer un buffer LOCAL pour construire l'image avant de l'envoyer au processus distant */
+    pe_image_buffer = (uint8_t*)malloc(pe_image_size);
+    if (!pe_image_buffer) {
+        printf("✗ Failed to allocate local buffer\n");
+        VirtualFreeEx(target_process_handle, pe_allocated_base, 0, MEM_RELEASE);
+        return;
+    }
+
+    memset(pe_image_buffer, 0, pe_image_size);
     pe_image_received = 0;
+#else
+    printf("⚠ Manual mapping not supported on this platform\n");
+    return;
+#endif
 
     /* Envoyer l'adresse de base au serveur */
     packet_t pkt;
@@ -628,40 +750,108 @@ static void handle_pe_image(packet_t* pkt) {
     }
 }
 
+/* Structure pour passer les données au shellcode de résolution d'imports */
+typedef struct {
+    /* Fonctions kernel32.dll */
+    void* pLoadLibraryA;
+    void* pGetProcAddress;
+
+    /* Données */
+    void* pImportData;          /* Pointeur vers les données d'import dans le processus distant */
+    uint32_t import_data_size;
+    void* pImageBase;           /* Base de l'image PE dans le processus distant */
+} shellcode_data_t;
+
 static void resolve_imports(void) {
-    printf("\n→ Resolving imports...\n");
+    printf("\n→ Resolving imports in remote process...\n");
 
 #ifdef _WIN32
-    /* Parser le buffer d'imports et résoudre */
-    uint32_t offset = 0;
-    uint32_t idx = 0;
+    if (!target_process_handle) {
+        printf("✗ No target process handle\n");
+        return;
+    }
 
-    while (offset < pe_imports_size && idx < import_count) {
+    /* Obtenir les adresses de LoadLibraryA et GetProcAddress
+     * Note: kernel32.dll est chargé à la même adresse dans tous les processus */
+    HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+    void* pLoadLibraryA = (void*)GetProcAddress(hKernel32, "LoadLibraryA");
+    void* pGetProcAddress = (void*)GetProcAddress(hKernel32, "GetProcAddress");
+
+    printf("   LoadLibraryA:   0x%p\n", pLoadLibraryA);
+    printf("   GetProcAddress: 0x%p\n", pGetProcAddress);
+
+    /* Allouer de la mémoire pour les données d'import dans le processus distant */
+    void* remote_import_data = VirtualAllocEx(target_process_handle, NULL, pe_imports_size,
+                                               MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!remote_import_data) {
+        printf("✗ Failed to allocate import data in remote process\n");
+        return;
+    }
+
+    /* Écrire les données d'import dans le processus distant */
+    SIZE_T bytes_written;
+    if (!WriteProcessMemory(target_process_handle, remote_import_data,
+                            pe_imports_buffer, pe_imports_size, &bytes_written)) {
+        printf("✗ Failed to write import data to remote process\n");
+        VirtualFreeEx(target_process_handle, remote_import_data, 0, MEM_RELEASE);
+        return;
+    }
+
+    printf("✓ Import data written to remote process at 0x%p\n", remote_import_data);
+
+    /* Shellcode pour résoudre les imports dans le processus distant
+     * Ce shellcode est en x86-64 et fait:
+     * 1. Lire les données de configuration
+     * 2. Parser le buffer d'imports
+     * 3. Appeler LoadLibraryA pour chaque DLL
+     * 4. Appeler GetProcAddress pour chaque fonction
+     * 5. Écrire l'adresse dans l'IAT
+     * 6. Retourner
+     */
+    unsigned char shellcode[] = {
+        /* Pour simplifier, on va utiliser une approche différente:
+         * On va résoudre les imports dans NOTRE processus, puis les écrire directement
+         * dans le processus distant via WriteProcessMemory.
+         * Ceci est plus simple et plus fiable. */
+        0xC3  /* ret - placeholder */
+    };
+
+    /* Approche simplifiée: résoudre les imports localement puis écrire dans le processus distant */
+    printf("   Resolving imports locally...\n");
+
+    uint32_t offset = 0;
+    uint32_t resolved_count = 0;
+
+    while (offset < pe_imports_size) {
         /* Lire le nom du module */
+        if (offset + 2 > pe_imports_size) break;
         uint16_t module_name_len;
         memcpy(&module_name_len, pe_imports_buffer + offset, 2);
         offset += 2;
 
+        if (offset + module_name_len > pe_imports_size) break;
         char module_name[256];
         memcpy(module_name, pe_imports_buffer + offset, module_name_len);
         module_name[module_name_len] = '\0';
         offset += module_name_len;
 
-        /* Charger le module */
+        /* Charger le module (dans notre processus pour obtenir l'adresse) */
         HMODULE hModule = LoadLibraryA(module_name);
         if (!hModule) {
             printf("   ✗ Failed to load module: %s\n", module_name);
-            offset += 2;  /* function_name_len */
+            /* Skip this import */
+            if (offset + 2 > pe_imports_size) break;
             uint16_t fn_len;
-            memcpy(&fn_len, pe_imports_buffer + offset - 2, 2);
-            if (fn_len == 0) offset += 2;  /* ordinal */
-            else offset += fn_len;
-            offset += 4;  /* IAT RVA */
-            idx++;
+            memcpy(&fn_len, pe_imports_buffer + offset, 2);
+            offset += 2;
+            if (fn_len == 0 && offset + 2 <= pe_imports_size) offset += 2;
+            else if (offset + fn_len <= pe_imports_size) offset += fn_len;
+            if (offset + 4 <= pe_imports_size) offset += 4;
             continue;
         }
 
         /* Lire le nom de la fonction ou l'ordinal */
+        if (offset + 2 > pe_imports_size) break;
         uint16_t function_name_len;
         memcpy(&function_name_len, pe_imports_buffer + offset, 2);
         offset += 2;
@@ -670,6 +860,7 @@ static void resolve_imports(void) {
 
         if (function_name_len == 0) {
             /* Import par ordinal */
+            if (offset + 2 > pe_imports_size) break;
             uint16_t ordinal;
             memcpy(&ordinal, pe_imports_buffer + offset, 2);
             offset += 2;
@@ -677,6 +868,7 @@ static void resolve_imports(void) {
             proc_addr = (void*)GetProcAddress(hModule, (LPCSTR)(uintptr_t)ordinal);
         } else {
             /* Import par nom */
+            if (offset + function_name_len > pe_imports_size) break;
             char function_name[256];
             memcpy(function_name, pe_imports_buffer + offset, function_name_len);
             function_name[function_name_len] = '\0';
@@ -686,41 +878,82 @@ static void resolve_imports(void) {
         }
 
         /* Lire l'IAT RVA */
+        if (offset + 4 > pe_imports_size) break;
         uint32_t iat_rva;
         memcpy(&iat_rva, pe_imports_buffer + offset, 4);
         offset += 4;
 
-        /* Écrire l'adresse dans l'IAT */
-        if (proc_addr) {
-            void** iat_entry = (void**)((uint8_t*)pe_allocated_base + iat_rva);
+        /* Écrire l'adresse directement dans le buffer local */
+        if (proc_addr && iat_rva < pe_image_size) {
+            void** iat_entry = (void**)(pe_image_buffer + iat_rva);
             *iat_entry = proc_addr;
-        } else {
-            printf("   ✗ Failed to resolve function\n");
+            resolved_count++;
+        } else if (!proc_addr) {
+            printf("   ✗ Failed to resolve import at offset %u\n", offset);
         }
-
-        idx++;
     }
 
-    printf("✓ Imports resolved (%u functions)\n", import_count);
+    printf("✓ Resolved %u imports\n", resolved_count);
+
+    /* Libérer les données d'import temporaires dans le processus distant */
+    VirtualFreeEx(target_process_handle, remote_import_data, 0, MEM_RELEASE);
+
 #else
     printf("⚠ Import resolution not supported on this platform\n");
 #endif
 }
 
 static void execute_pe(void) {
-    printf("\n→ Executing PE...\n");
+    printf("\n→ Writing PE image to remote process and executing...\n");
 
 #ifdef _WIN32
-    /* Calculer l'adresse du point d'entrée */
-    void* entry_point = (void*)((uint8_t*)pe_allocated_base + pe_entry_rva);
+    if (!target_process_handle) {
+        printf("✗ No target process handle\n");
+        return;
+    }
 
-    printf("✓ Entry point: 0x%p\n", entry_point);
+    /* Écrire l'image PE complète (avec imports résolus) dans le processus distant */
+    SIZE_T bytes_written;
+    if (!WriteProcessMemory(target_process_handle, pe_allocated_base,
+                            pe_image_buffer, pe_image_size, &bytes_written)) {
+        printf("✗ Failed to write PE image to remote process\n");
+        printf("   Error code: %lu\n", GetLastError());
 
-    /* Créer un thread pour exécuter le PE */
-    HANDLE hThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)entry_point, NULL, 0, NULL);
+        /* Envoyer échec au serveur */
+        packet_t pkt;
+        pkt_init(&pkt, PKT_PE_COMPLETE);
+        payload_pe_complete_t payload;
+        payload.success = 0;
+        payload.thread_id = 0;
+        pkt_set_payload(&pkt, &payload, sizeof(payload));
+        send_packet(&pkt, 1);
+        return;
+    }
+
+    printf("✓ PE image written to remote process (%llu bytes)\n", (unsigned long long)bytes_written);
+
+    /* Calculer l'adresse du point d'entrée dans le processus distant */
+    void* remote_entry_point = (void*)((uint8_t*)pe_allocated_base + pe_entry_rva);
+    printf("✓ Remote entry point: 0x%p\n", remote_entry_point);
+
+    /* Créer un thread DISTANT pour exécuter le PE (DllMain) */
+    DWORD thread_id = 0;
+    HANDLE hThread = CreateRemoteThread(target_process_handle, NULL, 0,
+                                        (LPTHREAD_START_ROUTINE)remote_entry_point,
+                                        pe_allocated_base,  /* DllMain parameter: HINSTANCE */
+                                        0, &thread_id);
     if (hThread) {
-        DWORD thread_id = GetThreadId(hThread);
-        printf("✓ Thread created (ID: %lu)\n", thread_id);
+        printf("✓ Remote thread created in PID %lu (Thread ID: %lu)\n", target_pid, thread_id);
+
+        /* Attendre un peu pour voir si le thread démarre correctement */
+        DWORD wait_result = WaitForSingleObject(hThread, 2000);
+        if (wait_result == WAIT_TIMEOUT) {
+            printf("✓ Thread is running (timeout after 2s - likely successful)\n");
+        } else if (wait_result == WAIT_OBJECT_0) {
+            DWORD exit_code;
+            GetExitCodeThread(hThread, &exit_code);
+            printf("✓ Thread completed with exit code: %lu\n", exit_code);
+        }
 
         /* Envoyer confirmation au serveur */
         packet_t pkt;
@@ -733,17 +966,37 @@ static void execute_pe(void) {
         pkt_set_payload(&pkt, &payload, sizeof(payload));
         send_packet(&pkt, 1);
 
-        printf("✓ PE injection completed successfully!\n");
+        printf("✓ PE manual mapping injection completed successfully!\n");
+        printf("   Target:  %s (PID: %lu)\n", target_process_name, target_pid);
+        printf("   Base:    0x%p\n", pe_allocated_base);
+        printf("   Entry:   0x%p\n", remote_entry_point);
 
         CloseHandle(hThread);
     } else {
-        printf("✗ Failed to create thread\n");
+        printf("✗ Failed to create remote thread\n");
+        printf("   Error code: %lu\n", GetLastError());
+
+        /* Envoyer échec au serveur */
+        packet_t pkt;
+        pkt_init(&pkt, PKT_PE_COMPLETE);
+        payload_pe_complete_t payload;
+        payload.success = 0;
+        payload.thread_id = 0;
+        pkt_set_payload(&pkt, &payload, sizeof(payload));
+        send_packet(&pkt, 1);
     }
+
+    /* Fermer le handle du processus */
+    if (target_process_handle) {
+        CloseHandle(target_process_handle);
+        target_process_handle = NULL;
+    }
+
 #else
     printf("⚠ PE execution not supported on this platform\n");
 #endif
 
-    /* Nettoyer */
+    /* Nettoyer les buffers locaux */
     if (pe_imports_buffer) {
         free(pe_imports_buffer);
         pe_imports_buffer = NULL;
@@ -751,5 +1004,9 @@ static void execute_pe(void) {
     if (import_table) {
         free(import_table);
         import_table = NULL;
+    }
+    if (pe_image_buffer) {
+        free(pe_image_buffer);
+        pe_image_buffer = NULL;
     }
 }

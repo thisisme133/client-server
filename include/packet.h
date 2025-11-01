@@ -15,12 +15,13 @@ typedef enum {
     PKT_HEARTBEAT = 7,
     PKT_CHALLENGE = 8,
     PKT_SESSION_KEY = 9,
-    PKT_GAME_SELECT = 10,
-    PKT_PE_METADATA = 11,
-    PKT_PE_IMPORTS = 12,
-    PKT_PE_BASE_ADDR = 13,
-    PKT_PE_IMAGE = 14,
-    PKT_PE_COMPLETE = 15
+    PKT_MODULE_LIST = 10,
+    PKT_GAME_SELECT = 11,
+    PKT_PE_METADATA = 12,
+    PKT_PE_IMPORTS = 13,
+    PKT_PE_BASE_ADDR = 14,
+    PKT_PE_IMAGE = 15,
+    PKT_PE_COMPLETE = 16
 } packet_type_t;
 
 /* Header de packet avec CRC - 8 bytes total */
@@ -80,6 +81,11 @@ typedef struct __attribute__((packed)) {
 
 /* PE Loading payloads */
 typedef struct __attribute__((packed)) {
+    uint8_t count;           /* Nombre de modules */
+    char modules[32][128];   /* Liste des noms de DLL */
+} payload_module_list_t;
+
+typedef struct __attribute__((packed)) {
     uint32_t module_id;      /* Identifiant du module */
 } payload_game_select_t;
 
@@ -87,9 +93,8 @@ typedef struct __attribute__((packed)) {
     uint32_t image_size;     /* SizeOfImage */
     uint32_t entry_rva;      /* RVA du point d'entrée */
     uint32_t imports_size;   /* Taille du buffer d'imports */
-    uint32_t target_pid;     /* PID du processus cible */
-    char process_name[64];   /* Nom du processus cible */
     uint8_t is_64bit;        /* 1 si PE64, 0 si PE32 */
+    char dll_name[128];      /* Nom de la DLL */
 } payload_pe_metadata_t;
 
 typedef struct __attribute__((packed)) {
