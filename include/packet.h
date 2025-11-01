@@ -84,7 +84,7 @@ void pkt_set_payload(packet_t* pkt, const void* data, uint16_t size);
 void pkt_get_payload(const packet_t* pkt, void* data, uint16_t* size);
 
 /* Serialization/Deserialization */
-uint16_t pkt_serialize(const packet_t* pkt, uint8_t* buffer);
+uint16_t pkt_serialize(packet_t* pkt, uint8_t* buffer);
 uint16_t pkt_deserialize(packet_t* pkt, const uint8_t* buffer, uint16_t buffer_size);
 
 /* Utilitaires */

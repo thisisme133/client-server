@@ -27,28 +27,26 @@ void pkt_get_payload(const packet_t* pkt, void* data, uint16_t* size) {
     if (size) *size = len;
 }
 
-uint16_t pkt_serialize(const packet_t* pkt, uint8_t* buffer) {
-    packet_t temp_pkt;
-    memcpy(&temp_pkt, pkt, sizeof(packet_t));
-
+uint16_t pkt_serialize(packet_t* pkt, uint8_t* buffer) {
     /* Calculer CRC sur header (sans CRC) + payload */
     uint8_t crc_buffer[MAX_PACKET_SIZE];
-    uint16_t crc_size = sizeof(packet_header_t) - sizeof(uint32_t) + temp_pkt.header.length;
+    uint16_t crc_size = sizeof(packet_header_t) - sizeof(uint32_t) + pkt->header.length;
 
-    memcpy(crc_buffer, &temp_pkt.header, sizeof(packet_header_t) - sizeof(uint32_t));
-    if (temp_pkt.header.length > 0) {
+    memcpy(crc_buffer, &pkt->header, sizeof(packet_header_t) - sizeof(uint32_t));
+    if (pkt->header.length > 0) {
         memcpy(crc_buffer + sizeof(packet_header_t) - sizeof(uint32_t),
-               temp_pkt.payload, temp_pkt.header.length);
+               pkt->payload, pkt->header.length);
     }
 
-    temp_pkt.header.crc = crc32_calculate(crc_buffer, crc_size);
+    /* Calculer et stocker le CRC dans le paquet original */
+    pkt->header.crc = crc32_calculate(crc_buffer, crc_size);
 
     /* Copier dans le buffer de sortie */
-    uint16_t total_size = sizeof(packet_header_t) + temp_pkt.header.length;
-    memcpy(buffer, &temp_pkt.header, sizeof(packet_header_t));
+    uint16_t total_size = sizeof(packet_header_t) + pkt->header.length;
+    memcpy(buffer, &pkt->header, sizeof(packet_header_t));
 
-    if (temp_pkt.header.length > 0) {
-        memcpy(buffer + sizeof(packet_header_t), temp_pkt.payload, temp_pkt.header.length);
+    if (pkt->header.length > 0) {
+        memcpy(buffer + sizeof(packet_header_t), pkt->payload, pkt->header.length);
     }
 
     return total_size;
