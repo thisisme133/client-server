@@ -13,8 +13,10 @@ Makefile
 *.exe
 *.out
 *.app
-server
-client
+/build/server
+/build/client
+/server
+/client
 *.a
 *.so
 *.dylib
