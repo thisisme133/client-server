@@ -45,6 +45,9 @@ static uint32_t pe_imports_received = 0;
 static void* pe_allocated_base = NULL;
 static uint8_t* pe_image_buffer = NULL;
 static uint32_t pe_image_received = 0;
+static uint32_t target_pid = 0;
+static char target_process_name[64] = {0};
+static uint8_t target_is_64bit = 0;
 
 /* Import entry structure for parsing */
 typedef struct {
@@ -68,7 +71,7 @@ static void handle_pe_image(packet_t* pkt);
 static void parse_imports_and_allocate(void);
 static void resolve_imports(void);
 static void execute_pe(void);
-static void send_game_select(uint32_t game_id, uint8_t arch);
+static void send_game_select(uint32_t module_id);
 
 /* Command handlers */
 static void cmd_stop(const char* args);
@@ -126,33 +129,26 @@ static void cmd_status(const char* args) {
 
 static void cmd_load(const char* args) {
     if (!connected || !authenticated) {
-        printf("\n✗ Must be connected and authenticated to load PE\n");
+        printf("\n✗ Must be connected and authenticated to load module\n");
         return;
     }
 
-    /* Parser les arguments: game_id arch */
-    uint32_t game_id = 0;
-    uint8_t arch = 0;
+    /* Parser l'argument: module_id */
+    uint32_t module_id = 0;
 
     if (!args || strlen(args) == 0) {
-        printf("\nUsage: load <game_id> <arch>\n");
-        printf("  game_id: Game identifier (number)\n");
-        printf("  arch:    0 = x86, 1 = x64\n");
-        printf("\nExample: load 1 0   (Load game 1 for x86)\n");
+        printf("\nUsage: load <module_id>\n");
+        printf("  module_id: Module identifier (0, 1, 2, ...)\n");
+        printf("\nExample: load 0   (Load module 0)\n");
         return;
     }
 
-    if (sscanf(args, "%u %hhu", &game_id, &arch) != 2) {
-        printf("\n✗ Invalid arguments. Usage: load <game_id> <arch>\n");
+    if (sscanf(args, "%u", &module_id) != 1) {
+        printf("\n✗ Invalid arguments. Usage: load <module_id>\n");
         return;
     }
 
-    if (arch > 1) {
-        printf("\n✗ Invalid architecture. Use 0 for x86 or 1 for x64\n");
-        return;
-    }
-
-    send_game_select(game_id, arch);
+    send_game_select(module_id);
 }
 
 int main(void) {
@@ -170,7 +166,7 @@ int main(void) {
     cmd_register("heartbeat", "Toggle heartbeat on/off", cmd_heartbeat);
     cmd_register("nolog", "Toggle packet logging on/off", cmd_nolog);
     cmd_register("status", "Show client status", cmd_status);
-    cmd_register("load", "Load and inject a PE file (args: game_id arch)", cmd_load);
+    cmd_register("load", "Load and inject a DLL module (args: module_id)", cmd_load);
 
     printf("Type 'help' for available commands\n\n");
     printf("> ");
@@ -444,15 +440,14 @@ static void send_connect(void) {
    PE Loading Functions
    ============================================ */
 
-static void send_game_select(uint32_t game_id, uint8_t arch) {
-    printf("\n→ Requesting game %u (%s)\n", game_id, arch == 0 ? "x86" : "x64");
+static void send_game_select(uint32_t module_id) {
+    printf("\n→ Requesting module %u\n", module_id);
 
     packet_t pkt;
     pkt_init(&pkt, PKT_GAME_SELECT);
 
     payload_game_select_t payload;
-    payload.game_id = game_id;
-    payload.arch = arch;
+    payload.module_id = module_id;
 
     pkt_set_payload(&pkt, &payload, sizeof(payload));
     send_packet(&pkt, 1);
@@ -466,8 +461,13 @@ static void handle_pe_metadata(packet_t* pkt) {
     pe_image_size = payload.image_size;
     pe_entry_rva = payload.entry_rva;
     pe_imports_size = payload.imports_size;
+    target_pid = payload.target_pid;
+    target_is_64bit = payload.is_64bit;
+    strncpy(target_process_name, payload.process_name, sizeof(target_process_name) - 1);
 
     printf("← PE Metadata received:\n");
+    printf("   Target process: %s (PID %u, %s)\n",
+           target_process_name, target_pid, target_is_64bit ? "x64" : "x86");
     printf("   Image size:   %u bytes\n", pe_image_size);
     printf("   Entry RVA:    0x%08X\n", pe_entry_rva);
     printf("   Imports size: %u bytes\n", pe_imports_size);

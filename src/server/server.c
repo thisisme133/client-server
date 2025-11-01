@@ -55,6 +55,8 @@ typedef struct {
     pe_import_buffer_t* import_buffer;
     uint64_t client_base_address;
     uint8_t* mapped_image;
+    uint32_t target_pid;
+    char target_process_name[64];
 } client_info_t;
 
 static client_info_t clients[MAX_CLIENTS];
@@ -63,6 +65,21 @@ static socket_t server_socket = INVALID_SOCKET_VALUE;
 /* Variables globales pour contrôle */
 static uint8_t server_running = 1;
 static uint8_t packet_logging_enabled = 1;
+
+/* Module mapping: processus -> DLL */
+typedef struct {
+    const char* process_name;
+    const char* dll_path;
+} module_mapping_t;
+
+#define MAX_MODULES 32
+static module_mapping_t module_mappings[MAX_MODULES];
+static uint32_t module_count = 0;
+
+/* Fonctions pour la gestion des modules */
+static void add_module(const char* process, const char* dll);
+static uint32_t find_process_by_name(const char* process_name);
+static int is_process_64bit(uint32_t pid);
 
 /* Prototypes */
 static THREAD_RETURN client_thread(void* arg);
@@ -144,12 +161,103 @@ static void cmd_list_clients(const char* args) {
     printf("╚════╩══════════════════════╩═══════╩═════════════════════════╝\n\n");
 }
 
+/* ============================================
+   Module Management Functions
+   ============================================ */
+
+static void add_module(const char* process, const char* dll) {
+    if (module_count >= MAX_MODULES) {
+        printf("✗ Module table full, cannot add %s\n", process);
+        return;
+    }
+
+    module_mappings[module_count].process_name = process;
+    module_mappings[module_count].dll_path = dll;
+    module_count++;
+}
+
+#ifdef _WIN32
+#include <tlhelp32.h>
+
+static uint32_t find_process_by_name(const char* process_name) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+
+    if (Process32First(hSnapshot, &pe32)) {
+        do {
+            if (_stricmp(pe32.szExeFile, process_name) == 0) {
+                CloseHandle(hSnapshot);
+                return pe32.th32ProcessID;
+            }
+        } while (Process32Next(hSnapshot, &pe32));
+    }
+
+    CloseHandle(hSnapshot);
+    return 0;
+}
+
+static int is_process_64bit(uint32_t pid) {
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!hProcess) {
+        return 0;
+    }
+
+    BOOL isWow64 = FALSE;
+    typedef BOOL (WINAPI *LPFN_ISWOW64PROCESS)(HANDLE, PBOOL);
+    LPFN_ISWOW64PROCESS fnIsWow64Process;
+
+    fnIsWow64Process = (LPFN_ISWOW64PROCESS)GetProcAddress(
+        GetModuleHandle(TEXT("kernel32")), "IsWow64Process");
+
+    if (fnIsWow64Process != NULL) {
+        if (!fnIsWow64Process(hProcess, &isWow64)) {
+            CloseHandle(hProcess);
+            return 0;
+        }
+    }
+
+    CloseHandle(hProcess);
+
+    /* Sur un système x64, si isWow64 est TRUE, c'est un processus 32-bit */
+    /* Si FALSE sur x64, c'est 64-bit. Sur x86, toujours 32-bit */
+#ifdef _WIN64
+    return !isWow64;
+#else
+    return 0;
+#endif
+}
+
+#else
+/* Sur Linux, pas d'injection de processus */
+static uint32_t find_process_by_name(const char* process_name) {
+    (void)process_name;
+    return 0;
+}
+
+static int is_process_64bit(uint32_t pid) {
+    (void)pid;
+    return 0;
+}
+#endif
+
 int main(void) {
     printf("═══════════════════════════════════════════════════════════\n");
     printf("    TCP Multi-threaded Server with Authentication\n");
     printf("═══════════════════════════════════════════════════════════\n\n");
 
     logger_init();
+
+    /* Initialiser les modules (processus -> DLL) */
+    add_module("csgo.exe", "games/csgo.dll");
+    add_module("notepad.exe", "games/notepad64.dll");
+    add_module("calc.exe", "games/calc.dll");
+
+    printf("✓ Loaded %u module mappings\n\n", module_count);
 
     /* Initialiser système de commandes */
     cmd_init();
@@ -525,29 +633,41 @@ static void handle_game_select(uint8_t client_id, packet_t* pkt) {
     uint16_t size;
     pkt_get_payload(pkt, &payload, &size);
 
-    printf("→ Client %d: Game select - ID=%u, Arch=%s\n",
-           client_id, payload.game_id, payload.arch == 0 ? "x86" : "x64");
+    printf("→ Client %d: Module select - ID=%u\n", client_id, payload.module_id);
 
-    /* Construire le chemin du fichier PE */
-    char pe_path[256];
-    snprintf(pe_path, sizeof(pe_path), "games/game_%u_%s.exe",
-             payload.game_id, payload.arch == 0 ? "x86" : "x64");
-
-    /* Afficher le working directory et vérifier l'existence du fichier */
-    char cwd[1024];
-    if (getcwd(cwd, sizeof(cwd)) != NULL) {
-        printf("   Working directory: %s\n", cwd);
+    /* Vérifier que le module_id est valide */
+    if (payload.module_id >= module_count) {
+        printf("✗ Client %d: Invalid module ID %u (max: %u)\n",
+               client_id, payload.module_id, module_count - 1);
+        return;
     }
-    printf("   Looking for: %s\n", pe_path);
 
-    /* Vérifier si le fichier existe */
-    FILE* test = fopen(pe_path, "rb");
-    if (test) {
-        fclose(test);
-        printf("   ✓ File exists\n");
-    } else {
-        printf("   ✗ File does not exist or cannot be opened\n");
+    const char* process_name = module_mappings[payload.module_id].process_name;
+    const char* dll_path = module_mappings[payload.module_id].dll_path;
+
+    printf("   Process: %s\n", process_name);
+    printf("   DLL: %s\n", dll_path);
+
+    /* Chercher le processus */
+    uint32_t pid = find_process_by_name(process_name);
+    if (pid == 0) {
+        printf("✗ Client %d: Process '%s' not found\n", client_id, process_name);
+        return;
     }
+
+    printf("   ✓ Found process: PID %u\n", pid);
+
+    /* Détecter l'architecture du processus */
+    int is_64 = is_process_64bit(pid);
+    printf("   Architecture: %s\n", is_64 ? "x64" : "x86");
+
+    /* Vérifier que la DLL existe */
+    FILE* test = fopen(dll_path, "rb");
+    if (!test) {
+        printf("✗ Client %d: DLL not found: %s\n", client_id, dll_path);
+        return;
+    }
+    fclose(test);
 
     /* Allouer et charger le PE */
     clients[client_id].pe_image = (pe_image_t*)malloc(sizeof(pe_image_t));
@@ -556,8 +676,8 @@ static void handle_game_select(uint8_t client_id, packet_t* pkt) {
         return;
     }
 
-    if (pe_load_file(pe_path, clients[client_id].pe_image) != 0) {
-        printf("✗ Client %d: Failed to load PE: %s\n", client_id, pe_path);
+    if (pe_load_file(dll_path, clients[client_id].pe_image) != 0) {
+        printf("✗ Client %d: Failed to load DLL: %s\n", client_id, dll_path);
         free(clients[client_id].pe_image);
         clients[client_id].pe_image = NULL;
         return;
@@ -591,6 +711,11 @@ static void handle_game_select(uint8_t client_id, packet_t* pkt) {
     printf("✓ Client %d: Import buffer built - Size=%u bytes\n",
            client_id, clients[client_id].import_buffer->size);
 
+    /* Stocker les infos du processus cible */
+    clients[client_id].target_pid = pid;
+    strncpy(clients[client_id].target_process_name, process_name, sizeof(clients[client_id].target_process_name) - 1);
+    clients[client_id].target_process_name[sizeof(clients[client_id].target_process_name) - 1] = '\0';
+
     /* Envoyer les métadonnées */
     send_pe_metadata(client_id);
 
@@ -603,14 +728,20 @@ static void send_pe_metadata(uint8_t client_id) {
     pkt_init(&pkt, PKT_PE_METADATA);
 
     payload_pe_metadata_t payload;
+    memset(&payload, 0, sizeof(payload));
     payload.image_size = clients[client_id].pe_image->image_size;
     payload.entry_rva = clients[client_id].pe_image->entry_rva;
     payload.imports_size = clients[client_id].import_buffer->size;
+    payload.target_pid = clients[client_id].target_pid;
+    payload.is_64bit = clients[client_id].pe_image->is_64bit;
+    strncpy(payload.process_name, clients[client_id].target_process_name, sizeof(payload.process_name) - 1);
 
     pkt_set_payload(&pkt, &payload, sizeof(payload));
     send_packet_to_client(client_id, &pkt, 1);
 
-    printf("✓ Client %d: PE metadata sent\n", client_id);
+    printf("✓ Client %d: PE metadata sent (PID=%u, %s, %s)\n",
+           client_id, payload.target_pid, payload.process_name,
+           payload.is_64bit ? "x64" : "x86");
 }
 
 static void send_pe_imports(uint8_t client_id) {

@@ -80,14 +80,16 @@ typedef struct __attribute__((packed)) {
 
 /* PE Loading payloads */
 typedef struct __attribute__((packed)) {
-    uint32_t game_id;      /* Identifiant du jeu */
-    uint8_t arch;          /* 0 = x86, 1 = x64 */
+    uint32_t module_id;      /* Identifiant du module */
 } payload_game_select_t;
 
 typedef struct __attribute__((packed)) {
     uint32_t image_size;     /* SizeOfImage */
     uint32_t entry_rva;      /* RVA du point d'entrée */
     uint32_t imports_size;   /* Taille du buffer d'imports */
+    uint32_t target_pid;     /* PID du processus cible */
+    char process_name[64];   /* Nom du processus cible */
+    uint8_t is_64bit;        /* 1 si PE64, 0 si PE32 */
 } payload_pe_metadata_t;
 
 typedef struct __attribute__((packed)) {
