@@ -4,9 +4,11 @@
 #include "crc.h"
 #include "crypto.h"
 #include "logger.h"
+#include "command.h"
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <stdlib.h>
 
 #ifdef _WIN32
     #include <windows.h>
@@ -49,6 +51,10 @@ typedef struct {
 static client_info_t clients[MAX_CLIENTS];
 static socket_t server_socket = INVALID_SOCKET_VALUE;
 
+/* Variables globales pour contrôle */
+static uint8_t server_running = 1;
+static uint8_t packet_logging_enabled = 1;
+
 /* Prototypes */
 static THREAD_RETURN client_thread(void* arg);
 static void handle_packet(uint8_t client_id, packet_t* pkt);
@@ -57,12 +63,89 @@ static void send_challenge(uint8_t client_id);
 static void send_session_key(uint8_t client_id);
 static void check_heartbeat_timeout(void);
 
+/* Command handlers */
+static void cmd_stop(const char* args);
+static void cmd_nolog(const char* args);
+static void cmd_stats(const char* args);
+static void cmd_list_clients(const char* args);
+
+static void cmd_stop(const char* args) {
+    (void)args;
+    printf("\n✓ Stopping server...\n");
+    server_running = 0;
+}
+
+static void cmd_nolog(const char* args) {
+    (void)args;
+    packet_logging_enabled = !packet_logging_enabled;
+    printf("\n✓ Packet logging: %s\n", packet_logging_enabled ? "ENABLED" : "DISABLED");
+}
+
+static void cmd_stats(const char* args) {
+    (void)args;
+    uint8_t active_count = 0;
+    uint8_t auth_count = 0;
+
+    for (uint8_t i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].active) {
+            active_count++;
+            if (clients[i].authenticated) auth_count++;
+        }
+    }
+
+    printf("\n╔════════════════════════════════════════════════════════════╗\n");
+    printf("║                     Server Statistics                      ║\n");
+    printf("╠════════════════════════════════════════════════════════════╣\n");
+    printf("║ Active clients      : %-36d║\n", active_count);
+    printf("║ Authenticated       : %-36d║\n", auth_count);
+    printf("║ Max clients         : %-36d║\n", MAX_CLIENTS);
+    printf("║ Packet logging      : %-36s║\n", packet_logging_enabled ? "ENABLED" : "DISABLED");
+    printf("╚════════════════════════════════════════════════════════════╝\n\n");
+}
+
+static void cmd_list_clients(const char* args) {
+    (void)args;
+    printf("\n╔════════════════════════════════════════════════════════════╗\n");
+    printf("║                       Active Clients                       ║\n");
+    printf("╠════╦══════════════════════╦═══════╦═════════════════════════╣\n");
+    printf("║ ID ║ IP Address           ║ Port  ║ Status                  ║\n");
+    printf("╠════╬══════════════════════╬═══════╬═════════════════════════╣\n");
+
+    uint8_t found = 0;
+    for (uint8_t i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].active) {
+            printf("║ %-2d ║ %-20s ║ %-5d ║ %-23s ║\n",
+                   i, clients[i].ip, clients[i].port,
+                   clients[i].authenticated ? "Authenticated" : "Not authenticated");
+            found = 1;
+        }
+    }
+
+    if (!found) {
+        printf("║              No active clients                             ║\n");
+    }
+
+    printf("╚════╩══════════════════════╩═══════╩═════════════════════════╝\n\n");
+}
+
 int main(void) {
     printf("═══════════════════════════════════════════════════════════\n");
     printf("    TCP Multi-threaded Server with Authentication\n");
     printf("═══════════════════════════════════════════════════════════\n\n");
 
     logger_init();
+
+    /* Initialiser système de commandes */
+    cmd_init();
+    cmd_register("help", "Show this help message", (command_callback_t)cmd_help);
+    cmd_register("stop", "Stop the server", cmd_stop);
+    cmd_register("nolog", "Toggle packet logging on/off", cmd_nolog);
+    cmd_register("stats", "Show server statistics", cmd_stats);
+    cmd_register("clients", "List active clients", cmd_list_clients);
+
+    printf("Type 'help' for available commands\n\n");
+    printf("> ");
+    fflush(stdout);
 
     /* Initialiser réseau */
     if (net_init() != 0) {
@@ -106,7 +189,10 @@ int main(void) {
     }
 
     /* Boucle principale d'acceptation */
-    while (1) {
+    while (server_running) {
+        /* Vérifier les commandes */
+        cmd_poll_stdin();
+
         /* Accepter nouvelle connexion */
         char ip[16];
         uint16_t port;
@@ -200,9 +286,11 @@ static THREAD_RETURN client_thread(void* arg) {
 
                 if (consumed > 0) {
                     char peer_info[32];
-                    snprintf(peer_info, sizeof(peer_info), "%s:%d",
-                             clients[client_id].ip, clients[client_id].port);
-                    log_packet(LOG_RECV, &pkt, peer_info);
+                    if (packet_logging_enabled) {
+                        snprintf(peer_info, sizeof(peer_info), "%s:%d",
+                                 clients[client_id].ip, clients[client_id].port);
+                        log_packet(LOG_RECV, &pkt, peer_info);
+                    }
 
                     /* Déchiffrer si nécessaire */
                     if (pkt_has_flag(&pkt, PKT_FLAG_ENCRYPTED) && clients[client_id].authenticated) {
@@ -359,10 +447,12 @@ static void send_packet_to_client(uint8_t client_id, packet_t* pkt, uint8_t encr
     uint8_t buffer[MAX_PACKET_SIZE];
     uint16_t size = pkt_serialize(pkt, buffer);
 
-    char peer_info[32];
-    snprintf(peer_info, sizeof(peer_info), "%s:%d",
-             clients[client_id].ip, clients[client_id].port);
-    log_packet(LOG_SEND, pkt, peer_info);
+    if (packet_logging_enabled) {
+        char peer_info[32];
+        snprintf(peer_info, sizeof(peer_info), "%s:%d",
+                 clients[client_id].ip, clients[client_id].port);
+        log_packet(LOG_SEND, pkt, peer_info);
+    }
 
     net_send(clients[client_id].socket, buffer, size);
 }

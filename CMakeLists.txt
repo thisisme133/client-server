@@ -37,6 +37,7 @@ add_library(common STATIC
     src/common/crc.c
     src/common/crypto.c
     src/common/logger.c
+    src/common/command.c
 )
 
 # Server executable

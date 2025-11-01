@@ -4,9 +4,11 @@
 #include "crc.h"
 #include "crypto.h"
 #include "logger.h"
+#include "command.h"
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <stdlib.h>
 
 #ifdef _WIN32
     #include <windows.h>
@@ -28,11 +30,70 @@ static uint32_t current_challenge = 0;
 static uint32_t heartbeat_sequence = 0;
 static time_t last_heartbeat = 0;
 
+/* Variables de contrôle */
+static uint8_t heartbeat_enabled = 1;
+static uint8_t packet_logging_enabled = 1;
+static time_t last_ping_time = 0;
+static uint8_t waiting_for_pong = 0;
+
 /* Prototypes */
 static void handle_packet(packet_t* pkt);
 static void send_packet(packet_t* pkt, uint8_t encrypt);
 static void send_heartbeat(void);
 static void send_connect(void);
+
+/* Command handlers */
+static void cmd_stop(const char* args);
+static void cmd_ping(const char* args);
+static void cmd_heartbeat(const char* args);
+static void cmd_nolog(const char* args);
+static void cmd_status(const char* args);
+
+static void cmd_stop(const char* args) {
+    (void)args;
+    printf("\n✓ Stopping client...\n");
+    connected = 0;
+}
+
+static void cmd_ping(const char* args) {
+    (void)args;
+    if (!connected) {
+        printf("\n✗ Not connected to server\n");
+        return;
+    }
+
+    printf("\n→ Sending PING to server...\n");
+    packet_t pkt;
+    pkt_init(&pkt, PKT_PING);
+    send_packet(&pkt, 0);
+    last_ping_time = time(NULL);
+    waiting_for_pong = 1;
+}
+
+static void cmd_heartbeat(const char* args) {
+    (void)args;
+    heartbeat_enabled = !heartbeat_enabled;
+    printf("\n✓ Heartbeat: %s\n", heartbeat_enabled ? "ENABLED" : "DISABLED");
+}
+
+static void cmd_nolog(const char* args) {
+    (void)args;
+    packet_logging_enabled = !packet_logging_enabled;
+    printf("\n✓ Packet logging: %s\n", packet_logging_enabled ? "ENABLED" : "DISABLED");
+}
+
+static void cmd_status(const char* args) {
+    (void)args;
+    printf("\n╔════════════════════════════════════════════════════════════╗\n");
+    printf("║                      Client Status                         ║\n");
+    printf("╠════════════════════════════════════════════════════════════╣\n");
+    printf("║ Connected           : %-36s║\n", connected ? "YES" : "NO");
+    printf("║ Authenticated       : %-36s║\n", authenticated ? "YES" : "NO");
+    printf("║ Heartbeat           : %-36s║\n", heartbeat_enabled ? "ENABLED" : "DISABLED");
+    printf("║ Packet logging      : %-36s║\n", packet_logging_enabled ? "ENABLED" : "DISABLED");
+    printf("║ Heartbeat sequence  : %-36u║\n", heartbeat_sequence);
+    printf("╚════════════════════════════════════════════════════════════╝\n\n");
+}
 
 int main(void) {
     printf("═══════════════════════════════════════════════════════════\n");
@@ -40,6 +101,19 @@ int main(void) {
     printf("═══════════════════════════════════════════════════════════\n\n");
 
     logger_init();
+
+    /* Initialiser système de commandes */
+    cmd_init();
+    cmd_register("help", "Show this help message", (command_callback_t)cmd_help);
+    cmd_register("stop", "Stop the client", cmd_stop);
+    cmd_register("ping", "Ping the server", cmd_ping);
+    cmd_register("heartbeat", "Toggle heartbeat on/off", cmd_heartbeat);
+    cmd_register("nolog", "Toggle packet logging on/off", cmd_nolog);
+    cmd_register("status", "Show client status", cmd_status);
+
+    printf("Type 'help' for available commands\n\n");
+    printf("> ");
+    fflush(stdout);
 
     /* Initialiser réseau */
     if (net_init() != 0) {
@@ -75,6 +149,9 @@ int main(void) {
     uint32_t test_message_counter = 0;
 
     while (connected) {
+        /* Vérifier les commandes */
+        cmd_poll_stdin();
+
         /* Recevoir données */
         int32_t received = net_recv(client_socket, buffer, BUFFER_SIZE);
 
@@ -86,7 +163,9 @@ int main(void) {
                 uint16_t consumed = pkt_deserialize(&pkt, buffer + offset, received - offset);
 
                 if (consumed > 0) {
-                    log_packet(LOG_RECV, &pkt, "Server");
+                    if (packet_logging_enabled) {
+                        log_packet(LOG_RECV, &pkt, "Server");
+                    }
 
                     /* Déchiffrer si nécessaire */
                     if (pkt_has_flag(&pkt, PKT_FLAG_ENCRYPTED) && authenticated) {
@@ -123,7 +202,7 @@ int main(void) {
         }
 
         /* Envoyer heartbeat si nécessaire */
-        if (authenticated) {
+        if (authenticated && heartbeat_enabled) {
             time_t now = time(NULL);
             if (difftime(now, last_heartbeat) >= HEARTBEAT_INTERVAL) {
                 send_heartbeat();
@@ -208,7 +287,14 @@ static void handle_packet(packet_t* pkt) {
         }
 
         case PKT_PONG: {
-            printf("← PONG received\n");
+            if (waiting_for_pong) {
+                time_t now = time(NULL);
+                double rtt = difftime(now, last_ping_time);
+                printf("← PONG received (RTT: %.0f ms)\n", rtt * 1000);
+                waiting_for_pong = 0;
+            } else {
+                printf("← PONG received\n");
+            }
             break;
         }
 
@@ -270,7 +356,9 @@ static void send_packet(packet_t* pkt, uint8_t encrypt) {
     uint8_t buffer[MAX_PACKET_SIZE];
     uint16_t size = pkt_serialize(pkt, buffer);
 
-    log_packet(LOG_SEND, pkt, "Server");
+    if (packet_logging_enabled) {
+        log_packet(LOG_SEND, pkt, "Server");
+    }
 
     net_send(client_socket, buffer, size);
 }
