@@ -31,6 +31,7 @@
 #define SERVER_PORT 8888
 #define BUFFER_SIZE 2048
 #define HEARTBEAT_TIMEOUT 10  /* 10 secondes */
+#define CHALLENGE_TIMEOUT 5   /* 5 secondes pour répondre au challenge */
 
 typedef struct {
     socket_t socket;
@@ -41,6 +42,7 @@ typedef struct {
     uint32_t current_challenge;
     uint8_t session_key[SESSION_KEY_SIZE];
     time_t last_heartbeat;
+    time_t challenge_sent_time;
     thread_t thread;
 } client_info_t;
 
@@ -127,6 +129,7 @@ int main(void) {
                 strncpy(clients[slot].ip, ip, 16);
                 clients[slot].port = port;
                 clients[slot].last_heartbeat = time(NULL);
+                clients[slot].challenge_sent_time = 0;
 
                 /* Générer challenge et clé de session */
                 clients[slot].current_challenge = crypto_generate_challenge();
@@ -215,6 +218,15 @@ static THREAD_RETURN client_thread(void* arg) {
             break;
         }
 
+        /* Vérifier timeout du challenge (5 secondes) */
+        if (clients[client_id].challenge_sent_time > 0) {
+            time_t now = time(NULL);
+            if (difftime(now, clients[client_id].challenge_sent_time) > CHALLENGE_TIMEOUT) {
+                printf("✗ Client %d: Challenge timeout (no response in 5s) - disconnecting silently\n", client_id);
+                break;
+            }
+        }
+
 #ifdef _WIN32
         Sleep(10);
 #else
@@ -257,6 +269,7 @@ static void handle_packet(uint8_t client_id, packet_t* pkt) {
 
             if (hb.challenge_response == expected) {
                 clients[client_id].last_heartbeat = time(NULL);
+                clients[client_id].challenge_sent_time = 0;  /* Réinitialiser le timeout */
 
                 /* Envoyer nouveau challenge */
                 clients[client_id].current_challenge = crypto_generate_challenge();
@@ -343,6 +356,10 @@ static void send_challenge(uint8_t client_id) {
     payload.challenge = clients[client_id].current_challenge;
 
     pkt_set_payload(&pkt, &payload, sizeof(payload));
+
+    /* Enregistrer le moment où le challenge est envoyé */
+    clients[client_id].challenge_sent_time = time(NULL);
+
     send_packet_to_client(client_id, &pkt, 0);
 }
 
