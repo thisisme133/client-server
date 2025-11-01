@@ -79,33 +79,38 @@ int main(void) {
         int32_t received = net_recv(client_socket, buffer, BUFFER_SIZE);
 
         if (received > 0) {
-            /* Désérialiser packet */
-            packet_t pkt;
-            uint16_t consumed = pkt_deserialize(&pkt, buffer, received);
+            /* Traiter tous les packets dans le buffer */
+            uint16_t offset = 0;
+            while (offset < (uint16_t)received) {
+                packet_t pkt;
+                uint16_t consumed = pkt_deserialize(&pkt, buffer + offset, received - offset);
 
-            if (consumed > 0) {
-                log_packet(LOG_RECV, &pkt, "Server");
+                if (consumed > 0) {
+                    log_packet(LOG_RECV, &pkt, "Server");
 
-                /* Déchiffrer si nécessaire */
-                if (pkt_has_flag(&pkt, PKT_FLAG_ENCRYPTED) && authenticated) {
-                    crypto_decrypt(session_key, pkt.payload, pkt.payload, pkt.header.length);
-                    pkt.header.flags &= ~PKT_FLAG_ENCRYPTED;
+                    /* Déchiffrer si nécessaire */
+                    if (pkt_has_flag(&pkt, PKT_FLAG_ENCRYPTED) && authenticated) {
+                        crypto_decrypt(session_key, pkt.payload, pkt.payload, pkt.header.length);
+                        pkt.header.flags &= ~PKT_FLAG_ENCRYPTED;
+                    }
+
+                    /* Décompresser si nécessaire */
+                    if (pkt_has_flag(&pkt, PKT_FLAG_COMPRESSED)) {
+                        uint8_t decompressed[MAX_PAYLOAD_SIZE];
+                        uint16_t decompressed_size = decompress_data(
+                            pkt.payload, pkt.header.length,
+                            decompressed, MAX_PAYLOAD_SIZE);
+                        memcpy(pkt.payload, decompressed, decompressed_size);
+                        pkt.header.length = decompressed_size;
+                        pkt.header.flags &= ~PKT_FLAG_COMPRESSED;
+                    }
+
+                    handle_packet(&pkt);
+                    offset += consumed;
+                } else {
+                    printf("✗ Invalid packet (CRC fail or malformed)\n");
+                    break;
                 }
-
-                /* Décompresser si nécessaire */
-                if (pkt_has_flag(&pkt, PKT_FLAG_COMPRESSED)) {
-                    uint8_t decompressed[MAX_PAYLOAD_SIZE];
-                    uint16_t decompressed_size = decompress_data(
-                        pkt.payload, pkt.header.length,
-                        decompressed, MAX_PAYLOAD_SIZE);
-                    memcpy(pkt.payload, decompressed, decompressed_size);
-                    pkt.header.length = decompressed_size;
-                    pkt.header.flags &= ~PKT_FLAG_COMPRESSED;
-                }
-
-                handle_packet(&pkt);
-            } else {
-                printf("✗ Invalid packet (CRC fail or malformed)\n");
             }
         } else if (received == 0) {
             printf("← Server closed connection\n");

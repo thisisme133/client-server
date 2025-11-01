@@ -167,8 +167,22 @@ static THREAD_RETURN client_thread(void* arg) {
 
     printf("→ Thread started for client %d\n", client_id);
 
+    /* Petit délai pour laisser le client se préparer */
+#ifdef _WIN32
+    Sleep(100);
+#else
+    usleep(100000);
+#endif
+
     /* Envoyer challenge */
     send_challenge(client_id);
+
+    /* Petit délai entre les deux packets */
+#ifdef _WIN32
+    Sleep(50);
+#else
+    usleep(50000);
+#endif
 
     /* Envoyer clé de session */
     send_session_key(client_id);
@@ -178,37 +192,42 @@ static THREAD_RETURN client_thread(void* arg) {
         int32_t received = net_recv(clients[client_id].socket, buffer, BUFFER_SIZE);
 
         if (received > 0) {
-            /* Désérialiser packet */
-            packet_t pkt;
-            uint16_t consumed = pkt_deserialize(&pkt, buffer, received);
+            /* Traiter tous les packets dans le buffer */
+            uint16_t offset = 0;
+            while (offset < (uint16_t)received) {
+                packet_t pkt;
+                uint16_t consumed = pkt_deserialize(&pkt, buffer + offset, received - offset);
 
-            if (consumed > 0) {
-                char peer_info[32];
-                snprintf(peer_info, sizeof(peer_info), "%s:%d",
-                         clients[client_id].ip, clients[client_id].port);
-                log_packet(LOG_RECV, &pkt, peer_info);
+                if (consumed > 0) {
+                    char peer_info[32];
+                    snprintf(peer_info, sizeof(peer_info), "%s:%d",
+                             clients[client_id].ip, clients[client_id].port);
+                    log_packet(LOG_RECV, &pkt, peer_info);
 
-                /* Déchiffrer si nécessaire */
-                if (pkt_has_flag(&pkt, PKT_FLAG_ENCRYPTED) && clients[client_id].authenticated) {
-                    crypto_decrypt(clients[client_id].session_key,
-                                 pkt.payload, pkt.payload, pkt.header.length);
-                    pkt.header.flags &= ~PKT_FLAG_ENCRYPTED;
+                    /* Déchiffrer si nécessaire */
+                    if (pkt_has_flag(&pkt, PKT_FLAG_ENCRYPTED) && clients[client_id].authenticated) {
+                        crypto_decrypt(clients[client_id].session_key,
+                                     pkt.payload, pkt.payload, pkt.header.length);
+                        pkt.header.flags &= ~PKT_FLAG_ENCRYPTED;
+                    }
+
+                    /* Décompresser si nécessaire */
+                    if (pkt_has_flag(&pkt, PKT_FLAG_COMPRESSED)) {
+                        uint8_t decompressed[MAX_PAYLOAD_SIZE];
+                        uint16_t decompressed_size = decompress_data(
+                            pkt.payload, pkt.header.length,
+                            decompressed, MAX_PAYLOAD_SIZE);
+                        memcpy(pkt.payload, decompressed, decompressed_size);
+                        pkt.header.length = decompressed_size;
+                        pkt.header.flags &= ~PKT_FLAG_COMPRESSED;
+                    }
+
+                    handle_packet(client_id, &pkt);
+                    offset += consumed;
+                } else {
+                    printf("✗ Client %d: Invalid packet (CRC fail or malformed)\n", client_id);
+                    break;
                 }
-
-                /* Décompresser si nécessaire */
-                if (pkt_has_flag(&pkt, PKT_FLAG_COMPRESSED)) {
-                    uint8_t decompressed[MAX_PAYLOAD_SIZE];
-                    uint16_t decompressed_size = decompress_data(
-                        pkt.payload, pkt.header.length,
-                        decompressed, MAX_PAYLOAD_SIZE);
-                    memcpy(pkt.payload, decompressed, decompressed_size);
-                    pkt.header.length = decompressed_size;
-                    pkt.header.flags &= ~PKT_FLAG_COMPRESSED;
-                }
-
-                handle_packet(client_id, &pkt);
-            } else {
-                printf("✗ Client %d: Invalid packet (CRC fail or malformed)\n", client_id);
             }
         } else if (received == 0) {
             printf("← Client %d disconnected\n", client_id);
