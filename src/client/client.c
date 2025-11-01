@@ -190,10 +190,12 @@ static void handle_packet(packet_t* pkt) {
 }
 
 static void handle_ack(packet_t* pkt) {
+    (void)pkt;  /* Paramètre non utilisé */
     printf("Received: ACK\n");
 }
 
 static void handle_pong(packet_t* pkt) {
+    (void)pkt;  /* Paramètre non utilisé */
     printf("Received: PONG\n");
 }
 
@@ -260,6 +262,7 @@ static void send_message(const char* msg) {
     send_packet(&pkt);
 }
 
+static void send_data(const uint8_t* data, uint16_t size) __attribute__((unused));
 static void send_data(const uint8_t* data, uint16_t size) {
     printf("Sending: DATA (%d bytes)\n", size);
 

@@ -14,15 +14,16 @@ if(MSVC)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /W4 /Os /GS- /GL")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /LTCG /OPT:REF /OPT:ICF")
     add_definitions(-D_CRT_SECURE_NO_WARNINGS)
+elseif(APPLE)
+    # macOS (Clang avec linker LLVM)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Os -ffunction-sections -fdata-sections")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-stack-protector -fno-unwind-tables -fno-asynchronous-unwind-tables")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-dead_strip")
 else()
-    # GCC/Clang (Linux/Mac)
+    # Linux (GCC/Clang avec linker GNU)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Os -ffunction-sections -fdata-sections")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-stack-protector -fno-unwind-tables -fno-asynchronous-unwind-tables")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections -Wl,--strip-all")
-
-    if(APPLE)
-        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-dead_strip")
-    endif()
 endif()
 
 # Include directories
@@ -54,13 +55,26 @@ if(WIN32)
 endif()
 
 # Strip les symboles en post-build
-if(UNIX AND NOT APPLE)
-    add_custom_command(TARGET server POST_BUILD
-        COMMAND strip -s $<TARGET_FILE:server>
-        COMMENT "Stripping server binary"
-    )
-    add_custom_command(TARGET client POST_BUILD
-        COMMAND strip -s $<TARGET_FILE:client>
-        COMMENT "Stripping client binary"
-    )
+if(UNIX)
+    if(APPLE)
+        # macOS : strip sans -s (non supporté)
+        add_custom_command(TARGET server POST_BUILD
+            COMMAND strip $<TARGET_FILE:server>
+            COMMENT "Stripping server binary"
+        )
+        add_custom_command(TARGET client POST_BUILD
+            COMMAND strip $<TARGET_FILE:client>
+            COMMENT "Stripping client binary"
+        )
+    else()
+        # Linux : strip avec -s
+        add_custom_command(TARGET server POST_BUILD
+            COMMAND strip -s $<TARGET_FILE:server>
+            COMMENT "Stripping server binary"
+        )
+        add_custom_command(TARGET client POST_BUILD
+            COMMAND strip -s $<TARGET_FILE:client>
+            COMMENT "Stripping client binary"
+        )
+    endif()
 endif()

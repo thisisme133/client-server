@@ -201,6 +201,7 @@ static void handle_packet(uint8_t client_id, packet_t* pkt) {
 }
 
 static void handle_ping(uint8_t client_id, packet_t* pkt) {
+    (void)pkt;  /* Paramètre non utilisé */
     printf("Client %d: PING\n", client_id);
 
     /* Répondre avec PONG */
