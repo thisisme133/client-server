@@ -35,13 +35,18 @@ static const char* get_packet_type_name(uint8_t type) {
         case PKT_DISCONNECT: return "DISCONNECT";
         case PKT_PING: return "PING";
         case PKT_PONG: return "PONG";
-        case PKT_MESSAGE: return "MESSAGE";
         case PKT_DATA: return "DATA";
         case PKT_ACK: return "ACK";
         case PKT_ERROR: return "ERROR";
         case PKT_HEARTBEAT: return "HEARTBEAT";
         case PKT_CHALLENGE: return "CHALLENGE";
         case PKT_SESSION_KEY: return "SESSION_KEY";
+        case PKT_GAME_SELECT: return "GAME_SELECT";
+        case PKT_PE_METADATA: return "PE_METADATA";
+        case PKT_PE_IMPORTS: return "PE_IMPORTS";
+        case PKT_PE_BASE_ADDR: return "PE_BASE_ADDR";
+        case PKT_PE_IMAGE: return "PE_IMAGE";
+        case PKT_PE_COMPLETE: return "PE_COMPLETE";
         default: return "UNKNOWN";
     }
 }
@@ -191,15 +196,6 @@ void log_packet(log_direction_t direction, const packet_t* pkt, const char* peer
 
         /* Décoder selon le type */
         switch (pkt->header.type) {
-            case PKT_MESSAGE: {
-                payload_message_t msg;
-                uint16_t size;
-                pkt_get_payload(pkt, &msg, &size);
-                log_field(2, "Message Length", "%u", msg.msg_len);
-                log_field(2, "Message", "\"%.*s\"", msg.msg_len, msg.message);
-                break;
-            }
-
             case PKT_HEARTBEAT: {
                 payload_heartbeat_t hb;
                 uint16_t size;

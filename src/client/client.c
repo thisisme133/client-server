@@ -207,7 +207,6 @@ int main(void) {
 
     /* Boucle principale */
     uint8_t buffer[BUFFER_SIZE];
-    uint32_t test_message_counter = 0;
 
     while (connected) {
         /* Vérifier les commandes */
@@ -268,23 +267,6 @@ int main(void) {
             if (difftime(now, last_heartbeat) >= HEARTBEAT_INTERVAL) {
                 send_heartbeat();
                 last_heartbeat = now;
-            }
-
-            /* Test: envoyer un message toutes les 10 secondes */
-            test_message_counter++;
-            if (test_message_counter >= 1000) {  /* ~10 secondes avec sleep de 10ms */
-                test_message_counter = 0;
-
-                packet_t msg_pkt;
-                pkt_init(&msg_pkt, PKT_MESSAGE);
-
-                payload_message_t msg;
-                const char* text = "Hello from client!";
-                msg.msg_len = strlen(text);
-                memcpy(msg.message, text, msg.msg_len);
-
-                pkt_set_payload(&msg_pkt, &msg, sizeof(uint16_t) + msg.msg_len);
-                send_packet(&msg_pkt, 1);
             }
         }
 
@@ -356,15 +338,6 @@ static void handle_packet(packet_t* pkt) {
             } else {
                 printf("← PONG received\n");
             }
-            break;
-        }
-
-        case PKT_MESSAGE: {
-            payload_message_t msg;
-            uint16_t size;
-            pkt_get_payload(pkt, &msg, &size);
-
-            printf("← Message echoed: \"%.*s\"\n", msg.msg_len, msg.message);
             break;
         }
 

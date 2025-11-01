@@ -9,19 +9,18 @@ typedef enum {
     PKT_DISCONNECT = 1,
     PKT_PING = 2,
     PKT_PONG = 3,
-    PKT_MESSAGE = 4,
-    PKT_DATA = 5,
-    PKT_ACK = 6,
-    PKT_ERROR = 7,
-    PKT_HEARTBEAT = 8,
-    PKT_CHALLENGE = 9,
-    PKT_SESSION_KEY = 10,
-    PKT_GAME_SELECT = 11,
-    PKT_PE_METADATA = 12,
-    PKT_PE_IMPORTS = 13,
-    PKT_PE_BASE_ADDR = 14,
-    PKT_PE_IMAGE = 15,
-    PKT_PE_COMPLETE = 16
+    PKT_DATA = 4,
+    PKT_ACK = 5,
+    PKT_ERROR = 6,
+    PKT_HEARTBEAT = 7,
+    PKT_CHALLENGE = 8,
+    PKT_SESSION_KEY = 9,
+    PKT_GAME_SELECT = 10,
+    PKT_PE_METADATA = 11,
+    PKT_PE_IMPORTS = 12,
+    PKT_PE_BASE_ADDR = 13,
+    PKT_PE_IMAGE = 14,
+    PKT_PE_COMPLETE = 15
 } packet_type_t;
 
 /* Header de packet avec CRC - 8 bytes total */
@@ -55,11 +54,6 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t reason;
 } payload_disconnect_t;
-
-typedef struct __attribute__((packed)) {
-    uint16_t msg_len;
-    char message[MAX_PAYLOAD_SIZE - 2];
-} payload_message_t;
 
 typedef struct __attribute__((packed)) {
     uint16_t data_len;

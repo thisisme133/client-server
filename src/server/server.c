@@ -14,6 +14,8 @@
 #ifdef _WIN32
     #include <windows.h>
     #include <process.h>
+    #include <direct.h>
+    #define getcwd _getcwd
     typedef HANDLE thread_t;
     #define thread_create(thread, func, arg) \
         (*(thread) = (HANDLE)_beginthreadex(NULL, 0, func, arg, 0, NULL))
@@ -415,12 +417,6 @@ static void handle_packet(uint8_t client_id, packet_t* pkt) {
             break;
         }
 
-        case PKT_MESSAGE: {
-            /* Echo le message chiffré */
-            send_packet_to_client(client_id, pkt, 1);
-            break;
-        }
-
         case PKT_DISCONNECT: {
             printf("Client %d requested disconnect\n", client_id);
             clients[client_id].active = 0;
@@ -536,6 +532,22 @@ static void handle_game_select(uint8_t client_id, packet_t* pkt) {
     char pe_path[256];
     snprintf(pe_path, sizeof(pe_path), "games/game_%u_%s.exe",
              payload.game_id, payload.arch == 0 ? "x86" : "x64");
+
+    /* Afficher le working directory et vérifier l'existence du fichier */
+    char cwd[1024];
+    if (getcwd(cwd, sizeof(cwd)) != NULL) {
+        printf("   Working directory: %s\n", cwd);
+    }
+    printf("   Looking for: %s\n", pe_path);
+
+    /* Vérifier si le fichier existe */
+    FILE* test = fopen(pe_path, "rb");
+    if (test) {
+        fclose(test);
+        printf("   ✓ File exists\n");
+    } else {
+        printf("   ✗ File does not exist or cannot be opened\n");
+    }
 
     /* Allouer et charger le PE */
     clients[client_id].pe_image = (pe_image_t*)malloc(sizeof(pe_image_t));
