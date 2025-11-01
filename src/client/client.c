@@ -36,11 +36,39 @@ static uint8_t packet_logging_enabled = 1;
 static time_t last_ping_time = 0;
 static uint8_t waiting_for_pong = 0;
 
+/* PE Loading variables */
+static uint32_t pe_image_size = 0;
+static uint32_t pe_entry_rva = 0;
+static uint32_t pe_imports_size = 0;
+static uint8_t* pe_imports_buffer = NULL;
+static uint32_t pe_imports_received = 0;
+static void* pe_allocated_base = NULL;
+static uint8_t* pe_image_buffer = NULL;
+static uint32_t pe_image_received = 0;
+
+/* Import entry structure for parsing */
+typedef struct {
+    uint32_t iat_rva;
+    void* resolved_address;
+} import_entry_t;
+
+static import_entry_t* import_table = NULL;
+static uint32_t import_count = 0;
+
 /* Prototypes */
 static void handle_packet(packet_t* pkt);
 static void send_packet(packet_t* pkt, uint8_t encrypt);
 static void send_heartbeat(void);
 static void send_connect(void);
+
+/* PE Loading handlers */
+static void handle_pe_metadata(packet_t* pkt);
+static void handle_pe_imports(packet_t* pkt);
+static void handle_pe_image(packet_t* pkt);
+static void parse_imports_and_allocate(void);
+static void resolve_imports(void);
+static void execute_pe(void);
+static void send_game_select(uint32_t game_id, uint8_t arch);
 
 /* Command handlers */
 static void cmd_stop(const char* args);
@@ -48,6 +76,7 @@ static void cmd_ping(const char* args);
 static void cmd_heartbeat(const char* args);
 static void cmd_nolog(const char* args);
 static void cmd_status(const char* args);
+static void cmd_load(const char* args);
 
 static void cmd_stop(const char* args) {
     (void)args;
@@ -95,6 +124,37 @@ static void cmd_status(const char* args) {
     printf("╚════════════════════════════════════════════════════════════╝\n\n");
 }
 
+static void cmd_load(const char* args) {
+    if (!connected || !authenticated) {
+        printf("\n✗ Must be connected and authenticated to load PE\n");
+        return;
+    }
+
+    /* Parser les arguments: game_id arch */
+    uint32_t game_id = 0;
+    uint8_t arch = 0;
+
+    if (!args || strlen(args) == 0) {
+        printf("\nUsage: load <game_id> <arch>\n");
+        printf("  game_id: Game identifier (number)\n");
+        printf("  arch:    0 = x86, 1 = x64\n");
+        printf("\nExample: load 1 0   (Load game 1 for x86)\n");
+        return;
+    }
+
+    if (sscanf(args, "%u %hhu", &game_id, &arch) != 2) {
+        printf("\n✗ Invalid arguments. Usage: load <game_id> <arch>\n");
+        return;
+    }
+
+    if (arch > 1) {
+        printf("\n✗ Invalid architecture. Use 0 for x86 or 1 for x64\n");
+        return;
+    }
+
+    send_game_select(game_id, arch);
+}
+
 int main(void) {
     printf("═══════════════════════════════════════════════════════════\n");
     printf("    TCP Client with Heartbeat Authentication\n");
@@ -110,6 +170,7 @@ int main(void) {
     cmd_register("heartbeat", "Toggle heartbeat on/off", cmd_heartbeat);
     cmd_register("nolog", "Toggle packet logging on/off", cmd_nolog);
     cmd_register("status", "Show client status", cmd_status);
+    cmd_register("load", "Load and inject a PE file (args: game_id arch)", cmd_load);
 
     printf("Type 'help' for available commands\n\n");
     printf("> ");
@@ -323,6 +384,21 @@ static void handle_packet(packet_t* pkt) {
             break;
         }
 
+        case PKT_PE_METADATA: {
+            handle_pe_metadata(pkt);
+            break;
+        }
+
+        case PKT_PE_IMPORTS: {
+            handle_pe_imports(pkt);
+            break;
+        }
+
+        case PKT_PE_IMAGE: {
+            handle_pe_image(pkt);
+            break;
+        }
+
         default:
             printf("← Unknown packet type: %d\n", pkt_get_type(pkt));
             break;
@@ -389,4 +465,318 @@ static void send_connect(void) {
 
     pkt_set_payload(&pkt, &payload, sizeof(payload));
     send_packet(&pkt, 0);
+}
+
+/* ============================================
+   PE Loading Functions
+   ============================================ */
+
+static void send_game_select(uint32_t game_id, uint8_t arch) {
+    printf("\n→ Requesting game %u (%s)\n", game_id, arch == 0 ? "x86" : "x64");
+
+    packet_t pkt;
+    pkt_init(&pkt, PKT_GAME_SELECT);
+
+    payload_game_select_t payload;
+    payload.game_id = game_id;
+    payload.arch = arch;
+
+    pkt_set_payload(&pkt, &payload, sizeof(payload));
+    send_packet(&pkt, 1);
+}
+
+static void handle_pe_metadata(packet_t* pkt) {
+    payload_pe_metadata_t payload;
+    uint16_t size;
+    pkt_get_payload(pkt, &payload, &size);
+
+    pe_image_size = payload.image_size;
+    pe_entry_rva = payload.entry_rva;
+    pe_imports_size = payload.imports_size;
+
+    printf("← PE Metadata received:\n");
+    printf("   Image size:   %u bytes\n", pe_image_size);
+    printf("   Entry RVA:    0x%08X\n", pe_entry_rva);
+    printf("   Imports size: %u bytes\n", pe_imports_size);
+
+    /* Allouer le buffer pour les imports */
+    pe_imports_buffer = (uint8_t*)malloc(pe_imports_size);
+    if (!pe_imports_buffer) {
+        printf("✗ Failed to allocate imports buffer\n");
+        return;
+    }
+
+    pe_imports_received = 0;
+    printf("✓ Ready to receive imports...\n");
+}
+
+static void handle_pe_imports(packet_t* pkt) {
+    payload_pe_imports_t payload;
+    uint16_t size;
+    pkt_get_payload(pkt, &payload, &size);
+
+    /* Copier le chunk dans le buffer */
+    memcpy(pe_imports_buffer + payload.offset, payload.data, payload.chunk_size);
+    pe_imports_received += payload.chunk_size;
+
+    printf("← Import chunk [%u/%u bytes]\n", pe_imports_received, payload.total_size);
+
+    /* Si tous les imports sont reçus, parser et allouer */
+    if (pe_imports_received >= payload.total_size) {
+        printf("✓ All imports received\n");
+        parse_imports_and_allocate();
+    }
+}
+
+static void parse_imports_and_allocate(void) {
+    printf("\n→ Parsing imports...\n");
+
+    /* Compter le nombre d'imports */
+    uint32_t offset = 0;
+    import_count = 0;
+
+    while (offset < pe_imports_size) {
+        uint16_t module_name_len;
+        if (offset + 2 > pe_imports_size) break;
+        memcpy(&module_name_len, pe_imports_buffer + offset, 2);
+        offset += 2;
+
+        if (offset + module_name_len > pe_imports_size) break;
+        offset += module_name_len;
+
+        uint16_t function_name_len;
+        if (offset + 2 > pe_imports_size) break;
+        memcpy(&function_name_len, pe_imports_buffer + offset, 2);
+        offset += 2;
+
+        if (function_name_len == 0) {
+            /* Ordinal import */
+            if (offset + 2 > pe_imports_size) break;
+            offset += 2;  /* ordinal */
+        } else {
+            if (offset + function_name_len > pe_imports_size) break;
+            offset += function_name_len;
+        }
+
+        if (offset + 4 > pe_imports_size) break;
+        offset += 4;  /* IAT RVA */
+
+        import_count++;
+    }
+
+    printf("   Found %u imports\n", import_count);
+
+    /* Allouer la table des imports */
+    import_table = (import_entry_t*)malloc(import_count * sizeof(import_entry_t));
+    if (!import_table) {
+        printf("✗ Failed to allocate import table\n");
+        return;
+    }
+
+    /* Parser et stocker les RVA */
+    offset = 0;
+    uint32_t idx = 0;
+
+    while (offset < pe_imports_size && idx < import_count) {
+        uint16_t module_name_len;
+        memcpy(&module_name_len, pe_imports_buffer + offset, 2);
+        offset += 2 + module_name_len;
+
+        uint16_t function_name_len;
+        memcpy(&function_name_len, pe_imports_buffer + offset, 2);
+        offset += 2;
+
+        if (function_name_len == 0) {
+            offset += 2;  /* ordinal */
+        } else {
+            offset += function_name_len;
+        }
+
+        uint32_t iat_rva;
+        memcpy(&iat_rva, pe_imports_buffer + offset, 4);
+        offset += 4;
+
+        import_table[idx].iat_rva = iat_rva;
+        import_table[idx].resolved_address = NULL;
+        idx++;
+    }
+
+    printf("✓ Imports parsed\n");
+
+    /* Allouer la mémoire pour l'image PE */
+#ifdef _WIN32
+    pe_allocated_base = VirtualAlloc(NULL, pe_image_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+#else
+    /* Sur Linux, on peut utiliser mmap mais pas d'exécution réelle */
+    pe_allocated_base = malloc(pe_image_size);
+#endif
+
+    if (!pe_allocated_base) {
+        printf("✗ Failed to allocate PE memory\n");
+        return;
+    }
+
+    printf("✓ Allocated %u bytes at 0x%p\n", pe_image_size, pe_allocated_base);
+
+    /* Allouer le buffer pour recevoir l'image */
+    pe_image_buffer = (uint8_t*)pe_allocated_base;
+    pe_image_received = 0;
+
+    /* Envoyer l'adresse de base au serveur */
+    packet_t pkt;
+    pkt_init(&pkt, PKT_PE_BASE_ADDR);
+
+    payload_pe_base_addr_t payload;
+    payload.base_address = (uint64_t)(uintptr_t)pe_allocated_base;
+
+    pkt_set_payload(&pkt, &payload, sizeof(payload));
+    send_packet(&pkt, 1);
+
+    printf("→ Base address sent to server: 0x%llX\n", (unsigned long long)payload.base_address);
+    printf("✓ Ready to receive PE image...\n");
+}
+
+static void handle_pe_image(packet_t* pkt) {
+    payload_pe_image_t payload;
+    uint16_t size;
+    pkt_get_payload(pkt, &payload, &size);
+
+    /* Copier le chunk dans le buffer */
+    memcpy(pe_image_buffer + payload.offset, payload.data, payload.chunk_size);
+    pe_image_received += payload.chunk_size;
+
+    printf("← Image chunk [%u/%u bytes]\n", pe_image_received, payload.total_size);
+
+    /* Si toute l'image est reçue, résoudre les imports et exécuter */
+    if (pe_image_received >= payload.total_size) {
+        printf("✓ Full PE image received\n");
+        resolve_imports();
+        execute_pe();
+    }
+}
+
+static void resolve_imports(void) {
+    printf("\n→ Resolving imports...\n");
+
+#ifdef _WIN32
+    /* Parser le buffer d'imports et résoudre */
+    uint32_t offset = 0;
+    uint32_t idx = 0;
+
+    while (offset < pe_imports_size && idx < import_count) {
+        /* Lire le nom du module */
+        uint16_t module_name_len;
+        memcpy(&module_name_len, pe_imports_buffer + offset, 2);
+        offset += 2;
+
+        char module_name[256];
+        memcpy(module_name, pe_imports_buffer + offset, module_name_len);
+        module_name[module_name_len] = '\0';
+        offset += module_name_len;
+
+        /* Charger le module */
+        HMODULE hModule = LoadLibraryA(module_name);
+        if (!hModule) {
+            printf("   ✗ Failed to load module: %s\n", module_name);
+            offset += 2;  /* function_name_len */
+            uint16_t fn_len;
+            memcpy(&fn_len, pe_imports_buffer + offset - 2, 2);
+            if (fn_len == 0) offset += 2;  /* ordinal */
+            else offset += fn_len;
+            offset += 4;  /* IAT RVA */
+            idx++;
+            continue;
+        }
+
+        /* Lire le nom de la fonction ou l'ordinal */
+        uint16_t function_name_len;
+        memcpy(&function_name_len, pe_imports_buffer + offset, 2);
+        offset += 2;
+
+        void* proc_addr = NULL;
+
+        if (function_name_len == 0) {
+            /* Import par ordinal */
+            uint16_t ordinal;
+            memcpy(&ordinal, pe_imports_buffer + offset, 2);
+            offset += 2;
+
+            proc_addr = (void*)GetProcAddress(hModule, (LPCSTR)(uintptr_t)ordinal);
+        } else {
+            /* Import par nom */
+            char function_name[256];
+            memcpy(function_name, pe_imports_buffer + offset, function_name_len);
+            function_name[function_name_len] = '\0';
+            offset += function_name_len;
+
+            proc_addr = (void*)GetProcAddress(hModule, function_name);
+        }
+
+        /* Lire l'IAT RVA */
+        uint32_t iat_rva;
+        memcpy(&iat_rva, pe_imports_buffer + offset, 4);
+        offset += 4;
+
+        /* Écrire l'adresse dans l'IAT */
+        if (proc_addr) {
+            void** iat_entry = (void**)((uint8_t*)pe_allocated_base + iat_rva);
+            *iat_entry = proc_addr;
+        } else {
+            printf("   ✗ Failed to resolve function\n");
+        }
+
+        idx++;
+    }
+
+    printf("✓ Imports resolved (%u functions)\n", import_count);
+#else
+    printf("⚠ Import resolution not supported on this platform\n");
+#endif
+}
+
+static void execute_pe(void) {
+    printf("\n→ Executing PE...\n");
+
+#ifdef _WIN32
+    /* Calculer l'adresse du point d'entrée */
+    void* entry_point = (void*)((uint8_t*)pe_allocated_base + pe_entry_rva);
+
+    printf("✓ Entry point: 0x%p\n", entry_point);
+
+    /* Créer un thread pour exécuter le PE */
+    HANDLE hThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)entry_point, NULL, 0, NULL);
+    if (hThread) {
+        DWORD thread_id = GetThreadId(hThread);
+        printf("✓ Thread created (ID: %lu)\n", thread_id);
+
+        /* Envoyer confirmation au serveur */
+        packet_t pkt;
+        pkt_init(&pkt, PKT_PE_COMPLETE);
+
+        payload_pe_complete_t payload;
+        payload.success = 1;
+        payload.thread_id = thread_id;
+
+        pkt_set_payload(&pkt, &payload, sizeof(payload));
+        send_packet(&pkt, 1);
+
+        printf("✓ PE injection completed successfully!\n");
+
+        CloseHandle(hThread);
+    } else {
+        printf("✗ Failed to create thread\n");
+    }
+#else
+    printf("⚠ PE execution not supported on this platform\n");
+#endif
+
+    /* Nettoyer */
+    if (pe_imports_buffer) {
+        free(pe_imports_buffer);
+        pe_imports_buffer = NULL;
+    }
+    if (import_table) {
+        free(import_table);
+        import_table = NULL;
+    }
 }

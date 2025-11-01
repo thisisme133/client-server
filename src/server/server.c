@@ -5,6 +5,7 @@
 #include "crypto.h"
 #include "logger.h"
 #include "command.h"
+#include "pe_loader.h"
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -46,6 +47,12 @@ typedef struct {
     time_t last_heartbeat;
     time_t challenge_sent_time;
     thread_t thread;
+
+    /* PE Loading */
+    pe_image_t* pe_image;
+    pe_import_buffer_t* import_buffer;
+    uint64_t client_base_address;
+    uint8_t* mapped_image;
 } client_info_t;
 
 static client_info_t clients[MAX_CLIENTS];
@@ -62,6 +69,13 @@ static void send_packet_to_client(uint8_t client_id, packet_t* pkt, uint8_t encr
 static void send_challenge(uint8_t client_id);
 static void send_session_key(uint8_t client_id);
 static void check_heartbeat_timeout(void);
+
+/* PE Loading handlers */
+static void handle_game_select(uint8_t client_id, packet_t* pkt);
+static void handle_pe_base_addr(uint8_t client_id, packet_t* pkt);
+static void send_pe_metadata(uint8_t client_id);
+static void send_pe_imports(uint8_t client_id);
+static void send_pe_image(uint8_t client_id);
 
 /* Command handlers */
 static void cmd_stop(const char* args);
@@ -413,6 +427,16 @@ static void handle_packet(uint8_t client_id, packet_t* pkt) {
             break;
         }
 
+        case PKT_GAME_SELECT: {
+            handle_game_select(client_id, pkt);
+            break;
+        }
+
+        case PKT_PE_BASE_ADDR: {
+            handle_pe_base_addr(client_id, pkt);
+            break;
+        }
+
         default:
             printf("Client %d: Unknown packet type %d\n", client_id, pkt_get_type(pkt));
             break;
@@ -494,4 +518,216 @@ static void check_heartbeat_timeout(void) {
             }
         }
     }
+}
+
+/* ============================================
+   PE Loading Functions
+   ============================================ */
+
+static void handle_game_select(uint8_t client_id, packet_t* pkt) {
+    payload_game_select_t payload;
+    uint16_t size;
+    pkt_get_payload(pkt, &payload, &size);
+
+    printf("→ Client %d: Game select - ID=%u, Arch=%s\n",
+           client_id, payload.game_id, payload.arch == 0 ? "x86" : "x64");
+
+    /* Construire le chemin du fichier PE */
+    char pe_path[256];
+    snprintf(pe_path, sizeof(pe_path), "games/game_%u_%s.exe",
+             payload.game_id, payload.arch == 0 ? "x86" : "x64");
+
+    /* Allouer et charger le PE */
+    clients[client_id].pe_image = (pe_image_t*)malloc(sizeof(pe_image_t));
+    if (!clients[client_id].pe_image) {
+        printf("✗ Client %d: Failed to allocate PE image\n", client_id);
+        return;
+    }
+
+    if (pe_load_file(pe_path, clients[client_id].pe_image) != 0) {
+        printf("✗ Client %d: Failed to load PE: %s\n", client_id, pe_path);
+        free(clients[client_id].pe_image);
+        clients[client_id].pe_image = NULL;
+        return;
+    }
+
+    printf("✓ Client %d: PE loaded - Size=%u, Entry=0x%X\n",
+           client_id,
+           clients[client_id].pe_image->image_size,
+           clients[client_id].pe_image->entry_rva);
+
+    /* Construire le buffer d'imports */
+    clients[client_id].import_buffer = (pe_import_buffer_t*)malloc(sizeof(pe_import_buffer_t));
+    if (!clients[client_id].import_buffer) {
+        printf("✗ Client %d: Failed to allocate import buffer\n", client_id);
+        pe_free(clients[client_id].pe_image);
+        free(clients[client_id].pe_image);
+        clients[client_id].pe_image = NULL;
+        return;
+    }
+
+    if (pe_build_import_buffer(clients[client_id].pe_image, clients[client_id].import_buffer) != 0) {
+        printf("✗ Client %d: Failed to build import buffer\n", client_id);
+        free(clients[client_id].import_buffer);
+        pe_free(clients[client_id].pe_image);
+        free(clients[client_id].pe_image);
+        clients[client_id].pe_image = NULL;
+        clients[client_id].import_buffer = NULL;
+        return;
+    }
+
+    printf("✓ Client %d: Import buffer built - Size=%u bytes\n",
+           client_id, clients[client_id].import_buffer->size);
+
+    /* Envoyer les métadonnées */
+    send_pe_metadata(client_id);
+
+    /* Envoyer le buffer d'imports */
+    send_pe_imports(client_id);
+}
+
+static void send_pe_metadata(uint8_t client_id) {
+    packet_t pkt;
+    pkt_init(&pkt, PKT_PE_METADATA);
+
+    payload_pe_metadata_t payload;
+    payload.image_size = clients[client_id].pe_image->image_size;
+    payload.entry_rva = clients[client_id].pe_image->entry_rva;
+    payload.imports_size = clients[client_id].import_buffer->size;
+
+    pkt_set_payload(&pkt, &payload, sizeof(payload));
+    send_packet_to_client(client_id, &pkt, 1);
+
+    printf("✓ Client %d: PE metadata sent\n", client_id);
+}
+
+static void send_pe_imports(uint8_t client_id) {
+    pe_import_buffer_t* imp_buf = clients[client_id].import_buffer;
+    uint32_t total_size = imp_buf->size;
+    uint32_t offset = 0;
+
+    /* Calculer la taille max d'un chunk */
+    uint16_t max_chunk = MAX_PAYLOAD_SIZE - 10;  /* 10 bytes pour les métadonnées du chunk */
+
+    while (offset < total_size) {
+        packet_t pkt;
+        pkt_init(&pkt, PKT_PE_IMPORTS);
+
+        payload_pe_imports_t payload;
+        payload.offset = offset;
+        payload.total_size = total_size;
+        payload.chunk_size = (total_size - offset) > max_chunk ? max_chunk : (total_size - offset);
+
+        memcpy(payload.data, imp_buf->buffer + offset, payload.chunk_size);
+
+        pkt_set_payload(&pkt, &payload, 10 + payload.chunk_size);
+        send_packet_to_client(client_id, &pkt, 1);
+
+        offset += payload.chunk_size;
+
+        printf("→ Client %d: Import chunk sent [%u/%u bytes]\n",
+               client_id, offset, total_size);
+
+        /* Petit délai entre les chunks */
+#ifdef _WIN32
+        Sleep(10);
+#else
+        usleep(10000);
+#endif
+    }
+
+    printf("✓ Client %d: All imports sent (%u bytes)\n", client_id, total_size);
+}
+
+static void handle_pe_base_addr(uint8_t client_id, packet_t* pkt) {
+    payload_pe_base_addr_t payload;
+    uint16_t size;
+    pkt_get_payload(pkt, &payload, &size);
+
+    clients[client_id].client_base_address = payload.base_address;
+
+    printf("→ Client %d: Base address received - 0x%llX\n",
+           client_id, (unsigned long long)payload.base_address);
+
+    /* Allouer le buffer pour l'image mappée */
+    uint32_t image_size = clients[client_id].pe_image->image_size;
+    clients[client_id].mapped_image = (uint8_t*)malloc(image_size);
+    if (!clients[client_id].mapped_image) {
+        printf("✗ Client %d: Failed to allocate mapped image buffer\n", client_id);
+        return;
+    }
+
+    /* Mapper les sections */
+    if (pe_map_sections(clients[client_id].pe_image, clients[client_id].mapped_image) != 0) {
+        printf("✗ Client %d: Failed to map sections\n", client_id);
+        free(clients[client_id].mapped_image);
+        clients[client_id].mapped_image = NULL;
+        return;
+    }
+
+    printf("✓ Client %d: Sections mapped\n", client_id);
+
+    /* Appliquer les relocations */
+    if (pe_apply_relocations(clients[client_id].pe_image,
+                             clients[client_id].mapped_image,
+                             payload.base_address) != 0) {
+        printf("✗ Client %d: Failed to apply relocations\n", client_id);
+        free(clients[client_id].mapped_image);
+        clients[client_id].mapped_image = NULL;
+        return;
+    }
+
+    printf("✓ Client %d: Relocations applied\n", client_id);
+
+    /* Envoyer l'image finale */
+    send_pe_image(client_id);
+
+    /* Nettoyer les ressources serveur */
+    pe_free(clients[client_id].pe_image);
+    free(clients[client_id].pe_image);
+    clients[client_id].pe_image = NULL;
+
+    pe_free_import_buffer(clients[client_id].import_buffer);
+    free(clients[client_id].import_buffer);
+    clients[client_id].import_buffer = NULL;
+
+    free(clients[client_id].mapped_image);
+    clients[client_id].mapped_image = NULL;
+}
+
+static void send_pe_image(uint8_t client_id) {
+    uint32_t total_size = clients[client_id].pe_image->image_size;
+    uint32_t offset = 0;
+
+    /* Calculer la taille max d'un chunk */
+    uint16_t max_chunk = MAX_PAYLOAD_SIZE - 10;
+
+    while (offset < total_size) {
+        packet_t pkt;
+        pkt_init(&pkt, PKT_PE_IMAGE);
+
+        payload_pe_image_t payload;
+        payload.offset = offset;
+        payload.total_size = total_size;
+        payload.chunk_size = (total_size - offset) > max_chunk ? max_chunk : (total_size - offset);
+
+        memcpy(payload.data, clients[client_id].mapped_image + offset, payload.chunk_size);
+
+        pkt_set_payload(&pkt, &payload, 10 + payload.chunk_size);
+        send_packet_to_client(client_id, &pkt, 1);
+
+        offset += payload.chunk_size;
+
+        printf("→ Client %d: Image chunk sent [%u/%u bytes]\n",
+               client_id, offset, total_size);
+
+        /* Petit délai entre les chunks */
+#ifdef _WIN32
+        Sleep(10);
+#else
+        usleep(10000);
+#endif
+    }
+
+    printf("✓ Client %d: Full PE image sent (%u bytes)\n", client_id, total_size);
 }

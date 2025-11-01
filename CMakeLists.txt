@@ -38,6 +38,7 @@ add_library(common STATIC
     src/common/crypto.c
     src/common/logger.c
     src/common/command.c
+    src/common/pe_loader.c
 )
 
 # Server executable

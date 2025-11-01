@@ -15,7 +15,13 @@ typedef enum {
     PKT_ERROR = 7,
     PKT_HEARTBEAT = 8,
     PKT_CHALLENGE = 9,
-    PKT_SESSION_KEY = 10
+    PKT_SESSION_KEY = 10,
+    PKT_GAME_SELECT = 11,
+    PKT_PE_METADATA = 12,
+    PKT_PE_IMPORTS = 13,
+    PKT_PE_BASE_ADDR = 14,
+    PKT_PE_IMAGE = 15,
+    PKT_PE_COMPLETE = 16
 } packet_type_t;
 
 /* Header de packet avec CRC - 8 bytes total */
@@ -77,6 +83,41 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t key[32];
 } payload_session_key_t;
+
+/* PE Loading payloads */
+typedef struct __attribute__((packed)) {
+    uint32_t game_id;      /* Identifiant du jeu */
+    uint8_t arch;          /* 0 = x86, 1 = x64 */
+} payload_game_select_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t image_size;     /* SizeOfImage */
+    uint32_t entry_rva;      /* RVA du point d'entrée */
+    uint32_t imports_size;   /* Taille du buffer d'imports */
+} payload_pe_metadata_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t offset;         /* Offset dans le buffer total */
+    uint32_t total_size;     /* Taille totale du buffer */
+    uint16_t chunk_size;     /* Taille de ce chunk */
+    uint8_t data[MAX_PAYLOAD_SIZE - 10];
+} payload_pe_imports_t;
+
+typedef struct __attribute__((packed)) {
+    uint64_t base_address;   /* Adresse de base allouée */
+} payload_pe_base_addr_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t offset;         /* Offset dans l'image totale */
+    uint32_t total_size;     /* Taille totale de l'image */
+    uint16_t chunk_size;     /* Taille de ce chunk */
+    uint8_t data[MAX_PAYLOAD_SIZE - 10];
+} payload_pe_image_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t success;         /* 1 si succès, 0 sinon */
+    uint32_t thread_id;      /* ID du thread créé */
+} payload_pe_complete_t;
 
 /* Fonctions de création de packets */
 void pkt_init(packet_t* pkt, uint8_t type);
