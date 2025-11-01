@@ -5,6 +5,7 @@
 #include "crypto.h"
 #include "logger.h"
 #include "command.h"
+#include "protected_function.h"
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -212,6 +213,12 @@ int main(void) {
 
     logger_init();
 
+#ifdef _WIN32
+    /* Initialiser le système de fonctions protégées */
+    protected_function_init();
+    protected_function_set_send_callback(send_packet);
+#endif
+
     /* Initialiser système de commandes */
     cmd_init();
     cmd_register("help", "Show this help message", (command_callback_t)cmd_help);
@@ -341,6 +348,11 @@ int main(void) {
     }
     net_cleanup();
 
+#ifdef _WIN32
+    /* Nettoyer le système de fonctions protégées */
+    protected_function_shutdown();
+#endif
+
     printf("\n✓ Client stopped\n");
     return 0;
 }
@@ -424,6 +436,13 @@ static void handle_packet(packet_t* pkt) {
 
         case PKT_PE_IMAGE: {
             handle_pe_image(pkt);
+            break;
+        }
+
+        case PKT_FUNCTION_RESPONSE: {
+#ifdef _WIN32
+            protected_function_handle_response(pkt);
+#endif
             break;
         }
 

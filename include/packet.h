@@ -21,7 +21,9 @@ typedef enum {
     PKT_PE_IMPORTS = 13,
     PKT_PE_BASE_ADDR = 14,
     PKT_PE_IMAGE = 15,
-    PKT_PE_COMPLETE = 16
+    PKT_PE_COMPLETE = 16,
+    PKT_FUNCTION_REQUEST = 17,
+    PKT_FUNCTION_RESPONSE = 18
 } packet_type_t;
 
 /* Header de packet avec CRC - 8 bytes total */
@@ -119,6 +121,18 @@ typedef struct __attribute__((packed)) {
     uint8_t success;         /* 1 si succès, 0 sinon */
     uint32_t thread_id;      /* ID du thread créé */
 } payload_pe_complete_t;
+
+/* Protected function request/response */
+typedef struct __attribute__((packed)) {
+    char function_name[256]; /* Nom de la fonction demandée */
+} payload_function_request_t;
+
+typedef struct __attribute__((packed)) {
+    char function_name[256]; /* Nom de la fonction */
+    uint32_t size;           /* Taille des bytes */
+    uint8_t success;         /* 1 si trouvée, 0 sinon */
+    uint8_t data[MAX_PAYLOAD_SIZE - 261];  /* Bytes de la fonction */
+} payload_function_response_t;
 
 /* Fonctions de création de packets */
 void pkt_init(packet_t* pkt, uint8_t type);

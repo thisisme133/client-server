@@ -6,6 +6,7 @@
 #include "logger.h"
 #include "command.h"
 #include "pe_loader.h"
+#include "protected_function_server.h"
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -526,6 +527,11 @@ static void handle_packet(uint8_t client_id, packet_t* pkt) {
 
         case PKT_PE_BASE_ADDR: {
             handle_pe_base_addr(client_id, pkt);
+            break;
+        }
+
+        case PKT_FUNCTION_REQUEST: {
+            handle_function_request(client_id, pkt, send_packet_to_client);
             break;
         }
 

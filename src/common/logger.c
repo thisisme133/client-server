@@ -41,12 +41,15 @@ static const char* get_packet_type_name(uint8_t type) {
         case PKT_HEARTBEAT: return "HEARTBEAT";
         case PKT_CHALLENGE: return "CHALLENGE";
         case PKT_SESSION_KEY: return "SESSION_KEY";
+        case PKT_MODULE_LIST: return "MODULE_LIST";
         case PKT_GAME_SELECT: return "GAME_SELECT";
         case PKT_PE_METADATA: return "PE_METADATA";
         case PKT_PE_IMPORTS: return "PE_IMPORTS";
         case PKT_PE_BASE_ADDR: return "PE_BASE_ADDR";
         case PKT_PE_IMAGE: return "PE_IMAGE";
         case PKT_PE_COMPLETE: return "PE_COMPLETE";
+        case PKT_FUNCTION_REQUEST: return "FUNCTION_REQUEST";
+        case PKT_FUNCTION_RESPONSE: return "FUNCTION_RESPONSE";
         default: return "UNKNOWN";
     }
 }

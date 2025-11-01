@@ -44,12 +44,14 @@ add_library(common STATIC
 # Server executable
 add_executable(server
     src/server/server.c
+    src/server/protected_function_server.c
 )
 target_link_libraries(server common)
 
 # Client executable
 add_executable(client
     src/client/client.c
+    src/client/protected_function_client.c
 )
 target_link_libraries(client common)
 
@@ -88,3 +90,6 @@ if(UNIX)
         )
     endif()
 endif()
+
+# Tools subdirectory (function patcher, etc.)
+add_subdirectory(tools)
