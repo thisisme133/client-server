@@ -4,6 +4,12 @@
 
 #include <windows.h>
 #include <winternl.h>
+#include <tlhelp32.h>
+#include <string.h>
+
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 /* Vérifie si un debugger est attaché */
 uint8_t is_debugger_present(void) {
@@ -72,7 +78,15 @@ uint8_t is_virtual_machine(void) {
     /* Méthode 2: Instruction CPUID pour détecter hyperviseur */
     #if defined(_M_X64) || defined(__x86_64__)
     int cpuInfo[4] = {0};
+    #ifdef _MSC_VER
     __cpuid(cpuInfo, 1);
+    #else
+    __asm__ __volatile__(
+        "cpuid"
+        : "=a"(cpuInfo[0]), "=b"(cpuInfo[1]), "=c"(cpuInfo[2]), "=d"(cpuInfo[3])
+        : "a"(1)
+    );
+    #endif
     /* Bit 31 de ECX indique présence hyperviseur */
     if (cpuInfo[2] & (1 << 31)) {
         return 1;

@@ -44,7 +44,7 @@ add_library(common STATIC
 # Server executable
 add_executable(server
     src/server/server.c
-    src/server/protected_function_server.c
+    src/server/blacklist.c
 )
 target_link_libraries(server common)
 
