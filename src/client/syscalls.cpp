@@ -114,6 +114,12 @@ SyscallManager::SyscallManager()
     , create_thread_(std::make_unique<SyscallStub>("NtCreateThreadEx"))
     , open_process_(std::make_unique<SyscallStub>("NtOpenProcess"))
     , close_(std::make_unique<SyscallStub>("NtClose"))
+    , query_vm_(std::make_unique<SyscallStub>("NtQueryVirtualMemory"))
+    , free_vm_(std::make_unique<SyscallStub>("NtFreeVirtualMemory"))
+    , read_vm_(std::make_unique<SyscallStub>("NtReadVirtualMemory"))
+    , query_sys_info_(std::make_unique<SyscallStub>("NtQuerySystemInformation"))
+    , query_proc_info_(std::make_unique<SyscallStub>("NtQueryInformationProcess"))
+    , set_thread_info_(std::make_unique<SyscallStub>("NtSetInformationThread"))
 {}
 
 std::expected<void*, long> SyscallManager::allocate_memory(
@@ -178,6 +184,124 @@ std::expected<NtHandleGuard, long> SyscallManager::open_process(
     auto status = open_process_->invoke<long>(&process, access, &obj_attr, &cid);
 
     return status >= 0 ? NtHandleGuard(process) : std::unexpected(status);
+}
+
+std::expected<size_t, long> SyscallManager::read_memory(
+    HANDLE process, void* base, std::span<uint8_t> buffer
+) const noexcept {
+    if (!read_vm_->valid()) return std::unexpected(-1L);
+
+    SIZE_T bytes_read = 0;
+    auto status = read_vm_->invoke<long>(
+        process, base, buffer.data(), buffer.size(), &bytes_read
+    );
+
+    return status >= 0 ? std::expected<size_t, long>(bytes_read) : std::unexpected(status);
+}
+
+std::expected<void, long> SyscallManager::free_memory(
+    HANDLE process, void* base, size_t size
+) const noexcept {
+    if (!free_vm_->valid()) return std::unexpected(-1L);
+
+    SIZE_T region_size = size;
+    auto status = free_vm_->invoke<long>(process, &base, &region_size, MEM_RELEASE);
+
+    return status >= 0 ? std::expected<void, long>() : std::unexpected(status);
+}
+
+std::expected<void, long> SyscallManager::query_virtual_memory(
+    HANDLE process, void* base, int info_class, void* info_buffer, size_t info_length, size_t* return_length
+) const noexcept {
+    if (!query_vm_->valid()) return std::unexpected(-1L);
+
+    SIZE_T ret_len = 0;
+    auto status = query_vm_->invoke<long>(
+        process, base, info_class, info_buffer, info_length, &ret_len
+    );
+
+    if (return_length) *return_length = ret_len;
+    return status >= 0 ? std::expected<void, long>() : std::unexpected(status);
+}
+
+std::expected<void, long> SyscallManager::query_information_process(
+    HANDLE process, int info_class, void* info_buffer, size_t info_length, size_t* return_length
+) const noexcept {
+    if (!query_proc_info_->valid()) return std::unexpected(-1L);
+
+    ULONG ret_len = 0;
+    auto status = query_proc_info_->invoke<long>(
+        process, info_class, info_buffer, static_cast<ULONG>(info_length), &ret_len
+    );
+
+    if (return_length) *return_length = ret_len;
+    return status >= 0 ? std::expected<void, long>() : std::unexpected(status);
+}
+
+std::expected<void, long> SyscallManager::set_information_thread(
+    HANDLE thread, int info_class, void* info_buffer, size_t info_length
+) const noexcept {
+    if (!set_thread_info_->valid()) return std::unexpected(-1L);
+
+    auto status = set_thread_info_->invoke<long>(
+        thread, info_class, info_buffer, static_cast<ULONG>(info_length)
+    );
+
+    return status >= 0 ? std::expected<void, long>() : std::unexpected(status);
+}
+
+// SSN Cache refresh and anti-tampering
+void SsnCache::refresh_if_needed() {
+    // Get current Windows build number
+    OSVERSIONINFOEXW osvi{};
+    osvi.dwOSVersionInfoSize = sizeof(osvi);
+
+    using RtlGetVersion = long(__stdcall*)(OSVERSIONINFOEXW*);
+    auto ntdll = GetModuleHandleA("ntdll.dll");
+    if (!ntdll) return;
+
+    auto rtl_get_version = reinterpret_cast<RtlGetVersion>(GetProcAddress(ntdll, "RtlGetVersion"));
+    if (!rtl_get_version) return;
+
+    rtl_get_version(&osvi);
+    uint32_t current_build = osvi.dwBuildNumber;
+
+    // Check if build changed or ntdll base changed
+    void* current_ntdll = ntdll;
+    if (windows_build_ != current_build || ntdll_base_ != current_ntdll) {
+        clear();
+        windows_build_ = current_build;
+        ntdll_base_ = current_ntdll;
+    }
+}
+
+bool SsnCache::verify_ntdll_integrity() const noexcept {
+    auto ntdll = GetModuleHandleA("ntdll.dll");
+    if (!ntdll) return false;
+
+    // Check DOS header
+    auto dos_header = reinterpret_cast<IMAGE_DOS_HEADER*>(ntdll);
+    if (dos_header->e_magic != IMAGE_DOS_SIGNATURE) return false;
+
+    // Check NT headers
+    auto nt_headers = reinterpret_cast<IMAGE_NT_HEADERS*>(
+        reinterpret_cast<uint8_t*>(ntdll) + dos_header->e_lfanew
+    );
+    if (nt_headers->Signature != IMAGE_NT_SIGNATURE) return false;
+
+    // Check .text section for hooks (basic check)
+    auto section = IMAGE_FIRST_SECTION(nt_headers);
+    for (WORD i = 0; i < nt_headers->FileHeader.NumberOfSections; ++i, ++section) {
+        if (std::memcmp(section->Name, ".text", 5) == 0) {
+            auto text_start = reinterpret_cast<uint8_t*>(ntdll) + section->VirtualAddress;
+            // Check first bytes for common hook patterns (JMP, CALL)
+            if (text_start[0] == 0xE9 || text_start[0] == 0xE8) {
+                return false; // Potential hook detected
+            }
+        }
+    }
+
+    return true;
 }
 
 } // namespace shadow

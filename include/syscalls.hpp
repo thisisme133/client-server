@@ -131,6 +131,8 @@ public:
 // Cache SSN singleton
 class SsnCache {
     std::unordered_map<std::string_view, uint32_t> cache_;
+    uint32_t windows_build_ = 0;
+    void* ntdll_base_ = nullptr;
 
     SsnCache() = default;
 
@@ -142,6 +144,13 @@ public:
 
     std::expected<uint32_t, std::string_view> lookup(std::string_view name);
     void insert(std::string_view name, uint32_t ssn) { cache_[name] = ssn; }
+
+    // Refresh mechanism
+    void refresh_if_needed();
+    void clear() { cache_.clear(); }
+
+    // Anti-tampering
+    [[nodiscard]] bool verify_ntdll_integrity() const noexcept;
 };
 
 // Syscall Manager
@@ -152,6 +161,14 @@ class SyscallManager {
     std::unique_ptr<SyscallStub> create_thread_;
     std::unique_ptr<SyscallStub> open_process_;
     std::unique_ptr<SyscallStub> close_;
+
+    // Additional syscalls
+    std::unique_ptr<SyscallStub> query_vm_;
+    std::unique_ptr<SyscallStub> free_vm_;
+    std::unique_ptr<SyscallStub> read_vm_;
+    std::unique_ptr<SyscallStub> query_sys_info_;
+    std::unique_ptr<SyscallStub> query_proc_info_;
+    std::unique_ptr<SyscallStub> set_thread_info_;
 
     SyscallManager();
 
@@ -192,6 +209,43 @@ public:
     std::expected<NtHandleGuard, long> open_process(
         uint32_t pid,
         uint32_t access = PROCESS_ALL_ACCESS
+    ) const noexcept;
+
+    // New syscalls
+    std::expected<size_t, long> read_memory(
+        HANDLE process,
+        void* base,
+        std::span<uint8_t> buffer
+    ) const noexcept;
+
+    std::expected<void, long> free_memory(
+        HANDLE process,
+        void* base,
+        size_t size
+    ) const noexcept;
+
+    std::expected<void, long> query_virtual_memory(
+        HANDLE process,
+        void* base,
+        int info_class,
+        void* info_buffer,
+        size_t info_length,
+        size_t* return_length
+    ) const noexcept;
+
+    std::expected<void, long> query_information_process(
+        HANDLE process,
+        int info_class,
+        void* info_buffer,
+        size_t info_length,
+        size_t* return_length
+    ) const noexcept;
+
+    std::expected<void, long> set_information_thread(
+        HANDLE thread,
+        int info_class,
+        void* info_buffer,
+        size_t info_length
     ) const noexcept;
 };
 
