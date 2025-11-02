@@ -2,6 +2,7 @@
 #include "packet.hpp"
 #include "crypto.hpp"
 #include "compression.hpp"
+#include "function_storage.hpp"
 
 #include <thread>
 #include <mutex>
@@ -166,6 +167,12 @@ private:
                 break;
             }
 
+            case FunctionRequest: {
+                auto* payload = packet.payload_as<proto::PayloadFunctionRequest>();
+                handle_function_request(payload->marker_hash);
+                break;
+            }
+
             default:
                 break;
         }
@@ -239,6 +246,29 @@ private:
 
             std::this_thread::sleep_for(1ms);
         }
+    }
+
+    void handle_function_request(uint32_t marker_hash) {
+        auto& storage = FunctionStorage::instance();
+
+        // Check if function exists
+        if (!storage.has_function(marker_hash)) {
+            // Function not found, could send error
+            return;
+        }
+
+        // Get function bytecode
+        auto code = storage.get_function_code(marker_hash);
+        if (code.empty()) return;
+
+        // Send function response
+        proto::Packet pkt{proto::PacketType::FunctionResponse};
+        auto* payload = pkt.payload_as<proto::PayloadFunctionResponse>();
+        payload->marker_hash = marker_hash;
+        payload->code_size = std::min(code.size(), payload->code.size());
+        std::memcpy(payload->code.data(), code.data(), payload->code_size);
+        pkt.set_payload(*payload);
+        send_packet(pkt, true);
     }
 };
 

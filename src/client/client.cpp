@@ -2,6 +2,7 @@
 #include "packet.hpp"
 #include "crypto.hpp"
 #include "compression.hpp"
+#include "protected_function.hpp"
 
 #ifdef _WIN32
 #include "syscalls.hpp"
@@ -34,7 +35,7 @@ inline constexpr uint32_t MAX_RECONNECT_ATTEMPTS = 10;
 
 // TODO: Add configurable server list (fallback servers)
 
-class GameClient {
+class GameClient : public protect::FunctionRequester {
     net::Socket socket_;
     bool authenticated_ = false;
     std::array<uint8_t, proto::SESSION_KEY_SIZE> session_key_{};
@@ -233,6 +234,12 @@ private:
                 break;
             }
 
+            case FunctionResponse: {
+                auto* payload = packet.payload_as<proto::PayloadFunctionResponse>();
+                handle_function_response(*payload);
+                break;
+            }
+
             default:
                 break;
         }
@@ -366,6 +373,28 @@ private:
             inject_pe();
 #endif
         }
+    }
+
+    // FunctionRequester interface implementation
+    bool request_function(uint32_t marker_hash) override {
+        proto::Packet pkt{proto::PacketType::FunctionRequest};
+        auto* payload = pkt.payload_as<proto::PayloadFunctionRequest>();
+        payload->marker_hash = marker_hash;
+        payload->timestamp = static_cast<uint32_t>(std::time(nullptr));
+        pkt.set_payload(*payload);
+
+        return send_packet(pkt, true).has_value();
+    }
+
+    void handle_function_response(const proto::PayloadFunctionResponse& payload) {
+        auto& cache = protect::FunctionCache::instance();
+
+        // Store function in cache
+        std::span<const uint8_t> code{payload.code.data(), payload.code_size};
+        cache.store(payload.marker_hash, code);
+
+        // Notify pending request
+        protect::PendingRequests::instance().complete(payload.marker_hash);
     }
 
 #ifdef _WIN32
@@ -519,6 +548,9 @@ int main() {
     }
 
     client::GameClient client;
+
+    // Set up protected function system
+    protect::FnProtectGlobal::set_requester(&client);
 
     if (auto result = client.connect(); !result) {
         return 1;

@@ -31,7 +31,9 @@ enum class PacketType : uint8_t {
     GameList,
     GameSelect,
     PEChunk,
-    PEComplete
+    PEComplete,
+    FunctionRequest,   // Client requests a protected function
+    FunctionResponse   // Server sends function code
 };
 
 // Packet flags
@@ -172,6 +174,17 @@ struct PayloadPEComplete {
     uint8_t reserved[3];
     uint32_t thread_id;
     uint64_t base_address;
+};
+
+struct PayloadFunctionRequest {
+    uint32_t marker_hash;  // FNV1a hash of function name
+    uint32_t timestamp;
+};
+
+struct PayloadFunctionResponse {
+    uint32_t marker_hash;
+    uint32_t code_size;
+    std::array<uint8_t, MAX_PAYLOAD_SIZE - 8> code;
 };
 
 // Utilities
