@@ -15,6 +15,25 @@
 
 namespace shadow {
 
+// TODO: Add more NT syscalls for complete functionality:
+//  - NtQueryVirtualMemory (query memory regions)
+//  - NtFreeVirtualMemory (free allocated memory)
+//  - NtReadVirtualMemory (read process memory)
+//  - NtQuerySystemInformation (system info enumeration)
+//  - NtQueryInformationProcess (process information)
+//  - NtSetInformationThread (thread manipulation)
+//  - NtDuplicateObject (handle duplication)
+//
+// TODO: Add syscall number refresh mechanism:
+//  - Detect Windows version changes
+//  - Refresh SSN cache on ntdll.dll reload
+//  - Handle syscall number changes across updates
+//
+// TODO: Add anti-tampering protection:
+//  - Verify ntdll.dll integrity before SSN extraction
+//  - Detect inline hooks in syscall stubs
+//  - Implement syscall instruction unhooking
+
 // Concepts
 template<typename T>
 concept NtHandle = std::same_as<T, HANDLE> || std::same_as<T, void*>;

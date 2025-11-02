@@ -40,6 +40,10 @@ std::expected<void, Error> Socket::set_nonblocking() noexcept {
 std::expected<size_t, Error> Socket::send(std::span<const uint8_t> data) noexcept {
     if (!valid()) return std::unexpected(Error::InvalidSocket);
 
+    // TODO: Add retry logic for partial sends (loop until all data sent)
+    // TODO: Add send timeout tracking
+    // TODO: Add total bytes sent counter for statistics
+
 #ifdef _WIN32
     int result = ::send(fd_, reinterpret_cast<const char*>(data.data()),
                        static_cast<int>(data.size()), 0);
@@ -117,6 +121,10 @@ std::expected<Socket, Error> create_socket() noexcept {
 }
 
 std::expected<Socket, Error> connect(std::string_view ip, uint16_t port) noexcept {
+    // TODO: Add connection timeout support (non-blocking connect + select/poll)
+    // TODO: Add retry logic with exponential backoff for failed connections
+    // TODO: Add DNS resolution support (currently only accepts IP addresses)
+
     auto socket_result = create_socket();
     if (!socket_result) return std::unexpected(socket_result.error());
 

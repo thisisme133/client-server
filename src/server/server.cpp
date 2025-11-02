@@ -24,11 +24,20 @@ inline constexpr uint16_t PORT = 8888;
 inline constexpr size_t MAX_CLIENTS = 32;
 inline constexpr size_t PE_CHUNK_COUNT = 150;
 
+// TODO: Load configuration from file (port, max_clients, timeout values)
+// TODO: Add rate limiting per client (packets per second, bandwidth)
+// TODO: Add logging system (connection events, errors, injections)
+// TODO: Add admin interface for monitoring and control
+
 struct GameInfo {
     uint32_t id;
     std::string name;
     std::filesystem::path dll_path;
     std::string target_process;
+
+    // TODO: Add version field for PE versioning
+    // TODO: Add checksum/signature for integrity verification
+    // TODO: Add encryption key for PE encryption at rest
 };
 
 class ClientSession {
@@ -38,6 +47,12 @@ class ClientSession {
     std::array<uint8_t, proto::SESSION_KEY_SIZE> session_key_{};
     uint32_t challenge_ = 0;
     std::string ip_;
+
+    // TODO: Add last_activity_ timestamp for idle timeout detection
+    // TODO: Add connection_time_ for session duration tracking
+    // TODO: Add statistics (packets_sent, packets_received, bytes_transferred)
+    // TODO: Add rate_limiter for packet flood protection
+    // TODO: Add reconnection token for session resumption
 
 public:
     explicit ClientSession(uint8_t id, net::Socket socket, std::string ip)
@@ -113,14 +128,24 @@ private:
             case ChallengeResponse: {
                 auto* payload = packet.payload_as<proto::PayloadChallengeResponse>();
 
+                // TODO: Add challenge timeout verification (reject if too slow/fast)
+                // TODO: Add challenge replay protection (store used challenges)
+                // TODO: Add brute-force protection (max attempts per IP)
+
                 uint32_t expected = crypto::solve_challenge(challenge_);
                 if (payload->challenge_solution != expected) {
+                    // TODO: Log failed authentication attempt with IP and timestamp
+                    // TODO: Increment failed_attempts counter for blacklisting
                     socket_ = {};
                     return;
                 }
 
                 // Check anti-debug flags
+                // TODO: Make anti-debug checks configurable per game
+                // TODO: Add whitelist for authorized debuggers (development mode)
+                // TODO: Add additional integrity checks (module hashes, imports)
                 if (payload->is_debugged || payload->is_vm || payload->is_suspended) {
+                    // TODO: Log security violation with details
                     socket_ = {};
                     return;
                 }
@@ -172,6 +197,22 @@ private:
     }
 
     void handle_game_select([[maybe_unused]] uint32_t game_id) {
+        // TODO: Implement real PE loading from disk:
+        //  - Load from GameInfo[game_id].dll_path
+        //  - Validate PE file integrity (signature, checksum)
+        //  - Encrypt PE data before transmission
+        //  - Compress PE data for bandwidth optimization
+        //
+        // TODO: Add access control:
+        //  - Check client subscription/license for game_id
+        //  - Verify client privileges and permissions
+        //  - Rate limit PE downloads per client
+        //
+        // TODO: Add PE streaming optimization:
+        //  - Implement adaptive chunk sizing based on network conditions
+        //  - Add chunk acknowledgments and retransmission
+        //  - Add checksum per chunk for integrity verification
+
         // Load PE file (simplified demo)
         std::vector<uint8_t> pe_data(4096, 0xCC);  // Demo: INT3 instructions
 

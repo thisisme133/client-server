@@ -46,6 +46,7 @@ enum class Error : int32_t {
     RecvFailed,
     InvalidSocket,
     WouldBlock
+    // TODO: Add timeout errors, SSL errors, connection reset errors
 };
 
 // RAII Socket wrapper
@@ -88,6 +89,12 @@ public:
     [[nodiscard]] std::expected<void, Error> set_nonblocking() noexcept;
     [[nodiscard]] std::expected<size_t, Error> send(std::span<const uint8_t> data) noexcept;
     [[nodiscard]] std::expected<size_t, Error> recv(std::span<uint8_t> buffer) noexcept;
+
+    // TODO: Add timeout support (setsockopt SO_RCVTIMEO/SO_SNDTIMEO)
+    // TODO: Add keep-alive configuration (SO_KEEPALIVE, TCP_KEEPIDLE, TCP_KEEPINTVL)
+    // TODO: Add buffer size configuration (SO_RCVBUF/SO_SNDBUF)
+    // TODO: Add SO_REUSEADDR/SO_REUSEPORT options for server sockets
+    // TODO: Add SSL/TLS wrapper class for encrypted connections
 };
 
 // Network Manager

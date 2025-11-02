@@ -20,6 +20,20 @@ namespace {
 std::expected<uint32_t, std::string_view> extract_ssn(void* function_address) noexcept {
     if (!function_address) return std::unexpected("Null function address");
 
+    // TODO: Add hook detection before SSN extraction:
+    //  - Check for JMP/CALL instructions at function start
+    //  - Verify expected NT function prologue
+    //  - Detect inline hooks and trampolines
+    //
+    // TODO: Add alternative SSN extraction methods:
+    //  - Parse SSDT (System Service Descriptor Table)
+    //  - Use neighboring functions for SSN calculation
+    //  - Implement Hell's Gate / Halo's Gate techniques
+    //
+    // TODO: Add verification of extracted SSN:
+    //  - Cross-reference with multiple sources
+    //  - Validate against known SSN ranges per Windows version
+
     auto bytes = std::span<const uint8_t>(static_cast<uint8_t*>(function_address), 24);
 
     for (size_t i = 0; i + 7 < bytes.size(); ++i) {

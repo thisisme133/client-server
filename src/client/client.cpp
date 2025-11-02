@@ -28,6 +28,11 @@ inline constexpr std::string_view SERVER_IP = "127.0.0.1";
 inline constexpr uint16_t SERVER_PORT = 8888;
 inline constexpr auto CHALLENGE_TIMEOUT = 5s;
 
+// TODO: Add heartbeat/keepalive mechanism to detect connection loss
+// TODO: Add automatic reconnection with exponential backoff
+// TODO: Add configurable server list (fallback servers)
+// TODO: Add connection quality metrics (latency, packet loss)
+
 class GameClient {
     net::Socket socket_;
     bool authenticated_ = false;
@@ -38,6 +43,10 @@ class GameClient {
     std::vector<uint8_t> pe_buffer_;
     uint32_t pe_entry_rva_ = 0;
     std::string target_process_;
+
+    // TODO: Add last_heartbeat_ timestamp for keepalive tracking
+    // TODO: Add reconnect_attempts_ counter for connection management
+    // TODO: Add statistics (bytes_sent, bytes_received, packets_processed)
 
 public:
     [[nodiscard]] auto connect() -> std::expected<void, net::Error> {
@@ -164,6 +173,23 @@ private:
 
         payload->challenge_solution = crypto::solve_challenge(current_challenge_);
 
+        // TODO: Implement comprehensive anti-debug checks:
+        //  - CheckRemoteDebuggerPresent
+        //  - NtQueryInformationProcess(ProcessDebugPort)
+        //  - NtSetInformationThread(ThreadHideFromDebugger)
+        //  - Hardware breakpoint detection (DR0-DR7 registers)
+        //
+        // TODO: Implement VM detection:
+        //  - CPUID checks (hypervisor bit)
+        //  - VMware/VirtualBox registry keys
+        //  - Timing attacks (RDTSC instruction)
+        //  - MAC address vendor checks
+        //
+        // TODO: Add integrity checks:
+        //  - Module hash verification
+        //  - Import table validation
+        //  - Code section checksum
+
 #ifdef _WIN32
         payload->is_debugged = IsDebuggerPresent() ? 1 : 0;
         payload->is_vm = 0;  // Simplified
@@ -207,6 +233,26 @@ private:
 
 #ifdef _WIN32
     void inject_pe() {
+        // TODO: Implement proper process enumeration:
+        //  - CreateToolhelp32Snapshot + Process32First/Process32Next
+        //  - Match by process name from target_process_
+        //  - Verify process architecture (x86/x64) matches PE
+        //  - Check process privileges and access rights
+        //
+        // TODO: Add PE validation before injection:
+        //  - Verify PE signature (MZ/PE headers)
+        //  - Validate DOS/NT headers
+        //  - Check sections alignment and RVAs
+        //  - Verify imports and relocations
+        //
+        // TODO: Implement manual mapping:
+        //  - Parse PE headers
+        //  - Map sections with correct memory protection
+        //  - Process relocations
+        //  - Resolve imports
+        //  - Call TLS callbacks
+        //  - Execute DllMain or entry point
+
         // Use modern C++23 syscalls
         auto& mgr = shadow::SyscallManager::instance();
 
