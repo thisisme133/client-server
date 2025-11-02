@@ -50,32 +50,27 @@ inline void decrypt(const K& key, std::span<const uint8_t> input, std::span<uint
     return result * 0x9E3779B9;
 }
 
+// CRC32 lookup table (compile-time generated)
+inline constexpr auto crc32_table = []() constexpr {
+    std::array<uint32_t, 256> table{};
+    for (uint32_t i = 0; i < 256; ++i) {
+        uint32_t crc = i;
+        for (uint32_t j = 0; j < 8; ++j) {
+            crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
+        }
+        table[i] = crc;
+    }
+    return table;
+}();
+
 // Fast CRC32 (optimized with lookup table)
 class CRC32 {
-    static constexpr auto generate_table() noexcept {
-        std::array<uint32_t, 256> table{};
-
-        for (uint32_t i = 0; i < 256; ++i) {
-            uint32_t crc = i;
-            for (uint32_t j = 0; j < 8; ++j) {
-                crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
-            }
-            table[i] = crc;
-        }
-
-        return table;
-    }
-
-    static constexpr auto table = generate_table();
-
 public:
     [[nodiscard]] static constexpr uint32_t compute(std::span<const uint8_t> data) noexcept {
         uint32_t crc = 0xFFFFFFFF;
-
         for (uint8_t byte : data) {
-            crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8);
+            crc = crc32_table[(crc ^ byte) & 0xFF] ^ (crc >> 8);
         }
-
         return ~crc;
     }
 

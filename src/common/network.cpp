@@ -3,6 +3,8 @@
 
 #ifdef _WIN32
 #pragma comment(lib, "ws2_32.lib")
+#else
+#include <fcntl.h>
 #endif
 
 namespace net {

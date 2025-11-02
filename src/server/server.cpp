@@ -11,7 +11,8 @@
 #include <string>
 #include <filesystem>
 #include <fstream>
-#include <print>
+#include <iostream>
+#include <random>
 #include <ranges>
 #include <algorithm>
 
@@ -150,7 +151,7 @@ private:
         auto* payload = pkt.payload_as<proto::PayloadSessionKey>();
 
         std::random_device rd;
-        std::ranges::generate(session_key_, [&rd] { return static_cast<uint8_t>(rd()); });
+        std::generate(session_key_.begin(), session_key_.end(), [&rd] { return static_cast<uint8_t>(rd()); });
 
         payload->key = session_key_;
         pkt.set_payload(*payload);
@@ -209,7 +210,7 @@ class GameServer {
 public:
     [[nodiscard]] auto start() -> std::expected<void, net::Error> {
         auto socket_result = net::create_socket();
-        if (!socket_result) return std::unexpected(socket_result->error());
+        if (!socket_result) return std::unexpected(socket_result.error());
 
         listen_socket_ = std::move(*socket_result);
 

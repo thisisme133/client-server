@@ -6,6 +6,9 @@
 #include <concepts>
 #include <bit>
 #include <string_view>
+#include <expected>
+#include <utility>
+#include <cstring>
 
 namespace proto {
 
