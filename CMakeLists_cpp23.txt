@@ -1,0 +1,74 @@
+cmake_minimum_required(VERSION 3.25)
+project(tcp_client_server_cpp23 CXX)
+
+# C++23 Standard
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Compiler flags
+if(MSVC)
+    add_compile_options(/W4 /std:c++latest /Zc:__cplusplus)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+else()
+    add_compile_options(-Wall -Wextra -Wpedantic -std=c++23)
+endif()
+
+# Optimization
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE MinSizeRel)
+endif()
+
+# Include directories
+include_directories(${CMAKE_SOURCE_DIR}/include)
+
+# Common library (C++23 modules would be ideal but CMake support is limited)
+add_library(common_cpp STATIC
+    src/common/network.cpp
+    src/common/packet.cpp
+    src/common/crypto.cpp
+    src/common/compression.cpp
+)
+
+# Client executable
+if(WIN32)
+    add_executable(client_cpp
+        src/client/client.cpp
+        src/client/syscalls.cpp
+        src/client/anti_debug.cpp
+    )
+    target_link_libraries(client_cpp common_cpp ws2_32)
+else()
+    add_executable(client_cpp
+        src/client/client.cpp
+        src/client/anti_debug.cpp
+    )
+    target_link_libraries(client_cpp common_cpp)
+endif()
+
+# Server executable
+add_executable(server_cpp
+    src/server/server.cpp
+    src/server/blacklist.cpp
+)
+target_link_libraries(server_cpp common_cpp)
+
+if(WIN32)
+    target_link_libraries(server_cpp ws2_32)
+else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(server_cpp ${CMAKE_THREAD_LIBS_INIT})
+    target_link_libraries(client_cpp ${CMAKE_THREAD_LIBS_INIT})
+endif()
+
+# Strip binaries
+if(UNIX AND NOT APPLE)
+    add_custom_command(TARGET client_cpp POST_BUILD
+        COMMAND strip -s $<TARGET_FILE:client_cpp>
+        COMMENT "Stripping client_cpp"
+    )
+    add_custom_command(TARGET server_cpp POST_BUILD
+        COMMAND strip -s $<TARGET_FILE:server_cpp>
+        COMMENT "Stripping server_cpp"
+    )
+endif()
