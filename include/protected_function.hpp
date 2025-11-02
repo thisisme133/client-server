@@ -308,6 +308,12 @@ public:
         }
     }
 
+    // Remove a pending request (e.g., on immediate send failure)
+    void remove(uint32_t marker_hash) {
+        std::lock_guard lock(mutex_);
+        requests_.erase(marker_hash);
+    }
+
     bool wait_for(uint32_t marker_hash, std::chrono::milliseconds timeout) {
         std::shared_ptr<Request> req;
         {

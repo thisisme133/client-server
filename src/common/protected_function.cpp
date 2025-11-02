@@ -11,6 +11,9 @@ bool FnProtectGlobal::request_and_wait(uint32_t marker_hash) {
 
     // Send request to server
     if (!requester_->request_function(marker_hash)) {
+        // CRITICAL: Clean up pending request on immediate send failure
+        // Without this, the request would remain in the map forever (memory leak)
+        pending.remove(marker_hash);
         return false;
     }
 
