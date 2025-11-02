@@ -31,6 +31,15 @@
 #define MAX_CLIENTS 32
 #define BUFFER_SIZE 2048
 #define CHALLENGE_TIMEOUT 5
+#define MAX_GAMES 16
+#define PE_CHUNK_COUNT 150
+
+typedef struct {
+    uint32_t game_id;
+    char game_name[64];
+    char dll_path[256];
+    char target_process[64];
+} game_info_t;
 
 typedef struct {
     uint8_t active;
@@ -40,13 +49,40 @@ typedef struct {
     uint32_t challenge;
     time_t challenge_time;
     char ip_address[46];
-    pe_image_t* pe_image;
     uint8_t* mapped_image;
     uint32_t image_size;
+    uint32_t entry_rva;
 } client_info_t;
 
 static client_info_t clients[MAX_CLIENTS];
 static socket_t server_socket = INVALID_SOCKET_VALUE;
+static game_info_t games[MAX_GAMES];
+static uint32_t game_count = 0;
+
+static void load_game_config(void) {
+    FILE* f = fopen("games/games.conf", "r");
+    if (!f) return;
+    
+    char line[512];
+    while (fgets(line, sizeof(line), f) && game_count < MAX_GAMES) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        
+        char* id_str = strtok(line, "|");
+        char* name = strtok(NULL, "|");
+        char* dll = strtok(NULL, "|");
+        char* process = strtok(NULL, "|\n");
+        
+        if (id_str && name && dll && process) {
+            games[game_count].game_id = atoi(id_str);
+            strncpy(games[game_count].game_name, name, 63);
+            snprintf(games[game_count].dll_path, 255, "games/%s", dll);
+            strncpy(games[game_count].target_process, process, 63);
+            game_count++;
+        }
+    }
+    
+    fclose(f);
+}
 
 static void handle_client_packet(uint8_t client_id, packet_t* pkt);
 static void send_packet_to_client(uint8_t client_id, packet_t* pkt, uint8_t encrypt);
@@ -88,8 +124,11 @@ static void send_game_list(uint8_t client_id) {
     
     payload_game_list_t payload;
     memset(&payload, 0, sizeof(payload));
-    payload.count = 1;
-    strncpy(payload.games[0], "Counter-Strike 2", 63);
+    payload.count = game_count;
+    
+    for (uint32_t i = 0; i < game_count && i < 16; i++) {
+        strncpy(payload.games[i], games[i].game_name, 63);
+    }
     
     pkt_set_payload(&pkt, &payload, sizeof(payload));
     send_packet_to_client(client_id, &pkt, 1);
@@ -100,29 +139,136 @@ static void handle_game_select(uint8_t client_id, packet_t* pkt) {
     uint16_t size;
     pkt_get_payload(pkt, &payload, &size);
     
-    /* TODO: Load actual game DLL based on game_id */
-    /* For now, use dummy PE data */
+    if (payload.game_id >= game_count) return;
     
-    /* Send PE in chunks */
-    uint32_t chunk_size = 900;
-    uint32_t total_chunks = 1;
+    game_info_t* game = &games[payload.game_id];
     
-    packet_t chunk_pkt;
-    pkt_init(&chunk_pkt, PKT_PE_CHUNK);
+    /* Load and parse PE */
+    pe_image_t pe_image;
+    if (pe_load_file(game->dll_path, &pe_image) != 0) {
+        return;
+    }
     
-    payload_pe_chunk_t chunk_payload;
-    memset(&chunk_payload, 0, sizeof(chunk_payload));
-    chunk_payload.chunk_index = 0;
-    chunk_payload.total_chunks = total_chunks;
-    chunk_payload.chunk_size = chunk_size;
-    chunk_payload.total_size = chunk_size;
-    chunk_payload.entry_rva = 0x1000;
+    /* Allocate buffer for mapped image */
+    clients[client_id].image_size = pe_image.image_size;
+    clients[client_id].mapped_image = (uint8_t*)calloc(1, pe_image.image_size);
+    if (!clients[client_id].mapped_image) {
+        return;
+    }
     
-    /* Fill with dummy data */
-    memset(chunk_payload.data, 0x90, chunk_size);
+    /* Map sections to buffer */
+    if (pe_map_sections(&pe_image, clients[client_id].mapped_image) != 0) {
+        free(clients[client_id].mapped_image);
+        clients[client_id].mapped_image = NULL;
+        return;
+    }
     
-    pkt_set_payload(&chunk_pkt, &chunk_payload, 20 + chunk_size);
-    send_packet_to_client(client_id, &chunk_pkt, 1);
+    /* Build import buffer (we'll resolve imports locally) */
+    pe_import_buffer_t import_buf;
+    memset(&import_buf, 0, sizeof(import_buf));
+
+    if (pe_build_import_buffer(&pe_image, &import_buf) == 0) {
+        /* Resolve imports in our buffer */
+        uint32_t offset = 0;
+        while (offset < import_buf.size) {
+            if (offset + 2 > import_buf.size) break;
+
+            uint16_t module_name_len;
+            memcpy(&module_name_len, import_buf.buffer + offset, 2);
+            offset += 2;
+
+            if (offset + module_name_len > import_buf.size) break;
+            char module_name[256];
+            memcpy(module_name, import_buf.buffer + offset, module_name_len);
+            module_name[module_name_len] = '\0';
+            offset += module_name_len;
+
+#ifdef _WIN32
+            HMODULE hModule = LoadLibraryA(module_name);
+#else
+            void* hModule = NULL;
+#endif
+
+            if (offset + 2 > import_buf.size) break;
+            uint16_t function_name_len;
+            memcpy(&function_name_len, import_buf.buffer + offset, 2);
+            offset += 2;
+
+            void* proc_addr = NULL;
+
+            if (function_name_len == 0) {
+                if (offset + 2 > import_buf.size) break;
+                uint16_t ordinal;
+                memcpy(&ordinal, import_buf.buffer + offset, 2);
+                offset += 2;
+#ifdef _WIN32
+                if (hModule) proc_addr = (void*)GetProcAddress(hModule, (LPCSTR)(uintptr_t)ordinal);
+#endif
+            } else {
+                if (offset + function_name_len > import_buf.size) break;
+                char function_name[256];
+                memcpy(function_name, import_buf.buffer + offset, function_name_len);
+                function_name[function_name_len] = '\0';
+                offset += function_name_len;
+#ifdef _WIN32
+                if (hModule) proc_addr = (void*)GetProcAddress(hModule, function_name);
+#endif
+            }
+
+            if (offset + 4 > import_buf.size) break;
+            uint32_t iat_rva;
+            memcpy(&iat_rva, import_buf.buffer + offset, 4);
+            offset += 4;
+
+            /* Write resolved address to IAT */
+            if (proc_addr && iat_rva < clients[client_id].image_size) {
+                void** iat_entry = (void**)(clients[client_id].mapped_image + iat_rva);
+                *iat_entry = proc_addr;
+            }
+        }
+
+        pe_free_import_buffer(&import_buf);
+    }
+    
+    /* Apply relocations for base address 0x7FFF0000 */
+    uint64_t preferred_base = 0x7FFF0000;
+    pe_apply_relocations(&pe_image, clients[client_id].mapped_image, preferred_base);
+    
+    clients[client_id].entry_rva = pe_image.entry_rva;
+    
+    /* Stream in exactly 150 chunks */
+    uint32_t chunk_size = (clients[client_id].image_size + PE_CHUNK_COUNT - 1) / PE_CHUNK_COUNT;
+    uint32_t offset_sent = 0;
+    
+    for (uint32_t i = 0; i < PE_CHUNK_COUNT; i++) {
+        packet_t chunk_pkt;
+        pkt_init(&chunk_pkt, PKT_PE_CHUNK);
+        
+        payload_pe_chunk_t chunk_payload;
+        memset(&chunk_payload, 0, sizeof(chunk_payload));
+        chunk_payload.chunk_index = i;
+        chunk_payload.total_chunks = PE_CHUNK_COUNT;
+        chunk_payload.total_size = clients[client_id].image_size;
+        chunk_payload.entry_rva = clients[client_id].entry_rva;
+        
+        uint32_t remaining = clients[client_id].image_size - offset_sent;
+        chunk_payload.chunk_size = (remaining > chunk_size) ? chunk_size : remaining;
+        
+        if (chunk_payload.chunk_size > 0 && offset_sent < clients[client_id].image_size) {
+            memcpy(chunk_payload.data, clients[client_id].mapped_image + offset_sent, 
+                   chunk_payload.chunk_size);
+            offset_sent += chunk_payload.chunk_size;
+        }
+        
+        pkt_set_payload(&chunk_pkt, &chunk_payload, 20 + chunk_payload.chunk_size);
+        send_packet_to_client(client_id, &chunk_pkt, 1);
+        
+#ifdef _WIN32
+        Sleep(1);
+#else
+        usleep(1000);
+#endif
+    }
 }
 
 static void handle_client_packet(uint8_t client_id, packet_t* pkt) {
@@ -132,7 +278,6 @@ static void handle_client_packet(uint8_t client_id, packet_t* pkt) {
             uint16_t size;
             pkt_get_payload(pkt, &payload, &size);
             
-            /* Vérifier timeout */
             time_t now = time(NULL);
             if (difftime(now, clients[client_id].challenge_time) > CHALLENGE_TIMEOUT) {
                 packet_t err;
@@ -142,14 +287,12 @@ static void handle_client_packet(uint8_t client_id, packet_t* pkt) {
                 break;
             }
             
-            /* Vérifier la solution */
             uint32_t expected = crypto_solve_challenge(clients[client_id].challenge);
             if (payload.challenge_solution != expected) {
                 clients[client_id].active = 0;
                 break;
             }
             
-            /* Vérifier anti-debug/VM */
             if (payload.is_debugged || payload.is_vm || payload.is_suspended) {
                 blacklist_add(clients[client_id].ip_address, 
                              payload.is_debugged ? "Debugger" : 
@@ -180,7 +323,6 @@ static void handle_client_packet(uint8_t client_id, packet_t* pkt) {
         }
         
         case PKT_PE_COMPLETE: {
-            /* Client a terminé l'injection */
             break;
         }
         
@@ -217,8 +359,8 @@ static void send_packet_to_client(uint8_t client_id, packet_t* pkt, uint8_t encr
     }
     
     uint8_t buffer[MAX_PACKET_SIZE];
-    uint16_t size = pkt_serialize(pkt, buffer);
-    net_send(clients[client_id].socket, buffer, size);
+    uint16_t pkt_size = pkt_serialize(pkt, buffer);
+    net_send(clients[client_id].socket, buffer, pkt_size);
 }
 
 static THREAD_RETURN client_thread(void* arg) {
@@ -227,7 +369,6 @@ static THREAD_RETURN client_thread(void* arg) {
     
     uint8_t buffer[BUFFER_SIZE];
     
-    /* Envoyer le challenge initial */
     send_challenge(client_id);
     
     while (clients[client_id].active) {
@@ -275,11 +416,9 @@ static THREAD_RETURN client_thread(void* arg) {
     }
     
     net_close_socket(clients[client_id].socket);
-    if (clients[client_id].pe_image) {
-        free(clients[client_id].pe_image);
-    }
     if (clients[client_id].mapped_image) {
         free(clients[client_id].mapped_image);
+        clients[client_id].mapped_image = NULL;
     }
     clients[client_id].active = 0;
     
@@ -291,6 +430,7 @@ int main(void) {
     
     logger_init();
     blacklist_init();
+    load_game_config();
     
     memset(clients, 0, sizeof(clients));
     
@@ -317,13 +457,13 @@ int main(void) {
     }
     
     while (1) {
-        char client_ip[46]; uint16_t client_port;
+        char client_ip[46];
+        uint16_t client_port;
         socket_t client_socket = net_accept(server_socket, client_ip, &client_port);
         if (client_socket == INVALID_SOCKET_VALUE) {
             continue;
         }
         
-        /* Trouver un slot libre */
         uint8_t client_id;
         for (client_id = 0; client_id < MAX_CLIENTS; client_id++) {
             if (!clients[client_id].active) break;
@@ -334,11 +474,8 @@ int main(void) {
             continue;
         }
         
-        /* Obtenir l'IP du client */
-        /* Note: Simplification - on utilise une IP dummy pour l'instant */
         strncpy(clients[client_id].ip_address, client_ip, sizeof(clients[client_id].ip_address) - 1);
         
-        /* Vérifier blacklist */
         if (blacklist_is_banned(clients[client_id].ip_address)) {
             net_close_socket(client_socket);
             continue;
