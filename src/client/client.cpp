@@ -17,6 +17,8 @@
 #include <string>
 #include <chrono>
 #include <thread>
+#include <mutex>
+#include <atomic>
 #include <iostream>
 #include <ranges>
 #include <algorithm>
@@ -28,10 +30,11 @@ namespace client {
 inline constexpr std::string_view SERVER_IP = "127.0.0.1";
 inline constexpr uint16_t SERVER_PORT = 8888;
 inline constexpr auto CHALLENGE_TIMEOUT = 5s;
-inline constexpr auto HEARTBEAT_INTERVAL = 30s;
-inline constexpr auto HEARTBEAT_TIMEOUT = 60s;
+inline constexpr auto HEARTBEAT_INTERVAL = 5s;  // Send heartbeat every 5s max
+inline constexpr auto HEARTBEAT_TIMEOUT = 10s;  // Disconnect if no challenge for 10s
 inline constexpr auto RECONNECT_BASE_DELAY = 1s;
 inline constexpr uint32_t MAX_RECONNECT_ATTEMPTS = 10;
+inline constexpr uint32_t HEARTBEAT_DIFFICULTY = 100000;  // Proof-of-work iterations
 
 // TODO: Add configurable server list (fallback servers)
 
@@ -46,9 +49,16 @@ class GameClient : public protect::FunctionRequester {
     uint32_t pe_entry_rva_ = 0;
     std::string target_process_;
 
-    // Heartbeat & reconnection
-    std::chrono::steady_clock::time_point last_heartbeat_sent_;
-    std::chrono::steady_clock::time_point last_heartbeat_received_;
+    // Heartbeat system
+    std::jthread heartbeat_thread_;
+    std::mutex heartbeat_mutex_;
+    std::mutex send_mutex_;  // Protect send_packet from concurrent access
+    std::atomic<bool> running_{false};
+    crypto::HeartbeatChallenge current_heartbeat_challenge_{};
+    std::chrono::steady_clock::time_point last_heartbeat_challenge_received_;
+    uint32_t session_id_ = 0;
+
+    // Reconnection
     uint32_t reconnect_attempts_ = 0;
 
     // Statistics
@@ -73,10 +83,16 @@ public:
             return std::unexpected(res.error());
         }
 
-        // Initialize heartbeat timestamps
+        // Initialize heartbeat system
         auto now = std::chrono::steady_clock::now();
-        last_heartbeat_sent_ = now;
-        last_heartbeat_received_ = now;
+        last_heartbeat_challenge_received_ = now;
+        running_ = true;
+        session_id_ = static_cast<uint32_t>(std::time(nullptr));
+
+        // Start heartbeat thread
+        heartbeat_thread_ = std::jthread([this](std::stop_token stoken) {
+            heartbeat_worker(stoken);
+        });
 
         return send_connect();
     }
@@ -84,19 +100,15 @@ public:
     void run() {
         std::array<uint8_t, 2048> buffer;
 
-        while (socket_.valid()) {
+        while (socket_.valid() && running_) {
             auto now = std::chrono::steady_clock::now();
 
-            // Check heartbeat timeout
-            if (now - last_heartbeat_received_ > HEARTBEAT_TIMEOUT) {
+            // Check heartbeat challenge timeout - server must send challenges
+            if (authenticated_ && now - last_heartbeat_challenge_received_ > HEARTBEAT_TIMEOUT) {
+                std::cout << "Heartbeat timeout - no challenge from server\n";
                 handle_disconnect();
                 if (!try_reconnect()) break;
                 continue;
-            }
-
-            // Send heartbeat if needed
-            if (now - last_heartbeat_sent_ > HEARTBEAT_INTERVAL) {
-                send_heartbeat();
             }
 
             auto received = socket_.recv(buffer);
@@ -117,9 +129,10 @@ public:
             }
 
             bytes_received_ += *received;
-            last_heartbeat_received_ = now;
             process_data(std::span{buffer.data(), *received});
         }
+
+        running_ = false;
     }
 
 private:
@@ -129,6 +142,8 @@ private:
     }
 
     auto send_packet(const proto::Packet& pkt, bool encrypt) -> std::expected<void, net::Error> {
+        std::lock_guard lock(send_mutex_);  // Protect concurrent sends
+
         std::array<uint8_t, proto::MAX_PACKET_SIZE> buffer;
         uint16_t size = pkt.serialize(buffer);
 
@@ -143,13 +158,71 @@ private:
         return result.transform([](auto) {});
     }
 
-    void send_heartbeat() {
-        proto::Packet pkt{proto::PacketType::Ack};
-        send_packet(pkt, false);
-        last_heartbeat_sent_ = std::chrono::steady_clock::now();
+    // Compute client state hash (anti-debug, anti-VM checks)
+    uint32_t compute_client_state_hash() const {
+        uint32_t state = 0;
+
+#ifdef _WIN32
+        state |= (check_debugger_present() ? 1 : 0) << 0;
+        state |= (check_vm_present() ? 1 : 0) << 1;
+#endif
+
+        // Mix in some timing/entropy to make it harder to predict
+        auto now = std::chrono::high_resolution_clock::now();
+        uint64_t nanos = now.time_since_epoch().count();
+        state ^= static_cast<uint32_t>(nanos & 0xFFFFFFFF);
+
+        return state;
+    }
+
+    // Heartbeat worker thread - runs in background
+    void heartbeat_worker(std::stop_token stoken) {
+        while (!stoken.stop_requested() && running_) {
+            std::this_thread::sleep_for(100ms);
+
+            if (!authenticated_ || !socket_.valid()) {
+                continue;
+            }
+
+            // Check if we have a pending challenge to solve
+            crypto::HeartbeatChallenge challenge;
+            {
+                std::lock_guard lock(heartbeat_mutex_);
+                challenge = current_heartbeat_challenge_;
+            }
+
+            // If we have a valid challenge (nonce != 0), solve it
+            if (challenge.nonce != 0) {
+                // Compute client state
+                uint32_t client_state = compute_client_state_hash();
+
+                // Solve the challenge with proof-of-work
+                auto solution = crypto::solve_heartbeat_challenge(
+                    challenge, session_key_, client_state
+                );
+
+                // Send response
+                proto::Packet pkt{proto::PacketType::HeartbeatResponse};
+                auto* payload = pkt.payload_as<proto::PayloadHeartbeatResponse>();
+                payload->solution = solution.solution;
+                payload->client_timestamp = solution.client_timestamp;
+                payload->client_state_hash = solution.client_state_hash;
+                payload->reserved = 0;
+
+                pkt.set_payload(*payload);
+                send_packet(pkt, true);
+
+                // Clear the challenge
+                {
+                    std::lock_guard lock(heartbeat_mutex_);
+                    current_heartbeat_challenge_ = {};
+                }
+            }
+        }
     }
 
     void handle_disconnect() {
+        running_ = false;
         socket_ = {};
         authenticated_ = false;
     }
@@ -222,6 +295,22 @@ private:
                 break;
             }
 
+            case HeartbeatChallenge: {
+                auto* payload = packet.payload_as<proto::PayloadHeartbeatChallenge>();
+
+                // Store the challenge for the heartbeat thread to solve
+                {
+                    std::lock_guard lock(heartbeat_mutex_);
+                    current_heartbeat_challenge_.nonce = payload->nonce;
+                    current_heartbeat_challenge_.timestamp = payload->timestamp;
+                    current_heartbeat_challenge_.difficulty = payload->difficulty;
+                    current_heartbeat_challenge_.session_id = payload->session_id;
+                }
+
+                last_heartbeat_challenge_received_ = std::chrono::steady_clock::now();
+                break;
+            }
+
             case GameList: {
                 auto* payload = packet.payload_as<proto::PayloadGameList>();
                 handle_game_list(*payload);
@@ -245,7 +334,7 @@ private:
         }
     }
 
-    bool check_debugger_present() {
+    bool check_debugger_present() const {
 #ifdef _WIN32
         // Check 1: IsDebuggerPresent
         if (IsDebuggerPresent()) return true;
@@ -281,7 +370,7 @@ private:
         return false;
     }
 
-    bool check_vm_present() {
+    bool check_vm_present() const {
 #ifdef _WIN32
         // Check 1: CPUID hypervisor bit
         int cpuInfo[4] = {0};

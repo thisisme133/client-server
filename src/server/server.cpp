@@ -24,6 +24,9 @@ namespace server {
 inline constexpr uint16_t PORT = 8888;
 inline constexpr size_t MAX_CLIENTS = 32;
 inline constexpr size_t PE_CHUNK_COUNT = 150;
+inline constexpr auto HEARTBEAT_INTERVAL = 5s;  // Send challenge every 5s
+inline constexpr auto HEARTBEAT_RESPONSE_TIMEOUT = 6s;  // Client must respond within 6s
+inline constexpr uint32_t HEARTBEAT_DIFFICULTY = 100000;  // Proof-of-work iterations
 
 // TODO: Load configuration from file (port, max_clients, timeout values)
 // TODO: Add rate limiting per client (packets per second, bandwidth)
@@ -49,7 +52,13 @@ class ClientSession {
     uint32_t challenge_ = 0;
     std::string ip_;
 
-    // TODO: Add last_activity_ timestamp for idle timeout detection
+    // Heartbeat system
+    crypto::HeartbeatChallenge current_heartbeat_challenge_{};
+    std::chrono::steady_clock::time_point last_heartbeat_sent_;
+    std::chrono::steady_clock::time_point last_heartbeat_response_;
+    uint32_t session_id_ = 0;
+    bool heartbeat_verified_ = false;
+
     // TODO: Add connection_time_ for session duration tracking
     // TODO: Add statistics (packets_sent, packets_received, bytes_transferred)
     // TODO: Add rate_limiter for packet flood protection
@@ -60,6 +69,13 @@ public:
         : socket_(std::move(socket)), id_(id), ip_(std::move(ip)) {
 
         socket_.set_nonblocking();
+
+        // Initialize heartbeat system
+        auto now = std::chrono::steady_clock::now();
+        last_heartbeat_sent_ = now;
+        last_heartbeat_response_ = now;
+        session_id_ = static_cast<uint32_t>(std::time(nullptr)) ^ (id << 16);
+
         send_challenge();
     }
 
@@ -68,6 +84,24 @@ public:
 
     void process() {
         std::array<uint8_t, 2048> buffer;
+
+        auto now = std::chrono::steady_clock::now();
+
+        // Check if authenticated client needs heartbeat challenge
+        if (authenticated_) {
+            // Send heartbeat challenge every HEARTBEAT_INTERVAL
+            if (now - last_heartbeat_sent_ > HEARTBEAT_INTERVAL) {
+                send_heartbeat_challenge();
+            }
+
+            // Check heartbeat response timeout - STRICT enforcement
+            if (heartbeat_verified_ && now - last_heartbeat_response_ > HEARTBEAT_RESPONSE_TIMEOUT) {
+                // Client failed to respond to heartbeat challenge in time
+                // IMMEDIATE disconnect - NO fake content, NO warnings
+                socket_ = {};
+                return;
+            }
+        }
 
         auto received = socket_.recv(buffer);
         if (!received) {
@@ -102,6 +136,32 @@ private:
         if (size > 0) {
             socket_.send(std::span{buffer.data(), size});
         }
+    }
+
+    void send_heartbeat_challenge() {
+        proto::Packet pkt{proto::PacketType::HeartbeatChallenge};
+        auto* payload = pkt.payload_as<proto::PayloadHeartbeatChallenge>();
+
+        // Generate random nonce
+        std::random_device rd;
+        uint64_t nonce = (static_cast<uint64_t>(rd()) << 32) | rd();
+
+        // Create challenge
+        current_heartbeat_challenge_.nonce = nonce;
+        current_heartbeat_challenge_.timestamp = static_cast<uint64_t>(std::time(nullptr));
+        current_heartbeat_challenge_.difficulty = HEARTBEAT_DIFFICULTY;
+        current_heartbeat_challenge_.session_id = session_id_;
+
+        payload->nonce = current_heartbeat_challenge_.nonce;
+        payload->timestamp = current_heartbeat_challenge_.timestamp;
+        payload->difficulty = current_heartbeat_challenge_.difficulty;
+        payload->session_id = current_heartbeat_challenge_.session_id;
+
+        pkt.set_payload(*payload);
+        send_packet(pkt, true);
+
+        last_heartbeat_sent_ = std::chrono::steady_clock::now();
+        heartbeat_verified_ = true;  // Now we expect a response
     }
 
     void handle_data(std::span<const uint8_t> data) {
@@ -158,6 +218,37 @@ private:
             case Connect: {
                 authenticated_ = true;
                 send_game_list();
+                break;
+            }
+
+            case HeartbeatResponse: {
+                auto* payload = packet.payload_as<proto::PayloadHeartbeatResponse>();
+
+                // Verify the solution using strict validation
+                crypto::HeartbeatSolution solution{};
+                solution.solution = payload->solution;
+                solution.client_timestamp = payload->client_timestamp;
+                solution.client_state_hash = payload->client_state_hash;
+                solution.reserved = payload->reserved;
+
+                uint64_t server_time = static_cast<uint64_t>(std::time(nullptr));
+
+                bool valid = crypto::verify_heartbeat_solution(
+                    current_heartbeat_challenge_,
+                    solution,
+                    session_key_,
+                    server_time
+                );
+
+                if (!valid) {
+                    // Invalid heartbeat response - IMMEDIATE disconnect
+                    // NO fake content, NO warnings - just disconnect
+                    socket_ = {};
+                    return;
+                }
+
+                // Valid response - update timestamp
+                last_heartbeat_response_ = std::chrono::steady_clock::now();
                 break;
             }
 
@@ -287,27 +378,39 @@ class GameServer {
 
 public:
     [[nodiscard]] auto start() -> std::expected<void, net::Error> {
+        std::cout << "Creating listen socket...\n";
         auto socket_result = net::create_socket();
-        if (!socket_result) return std::unexpected(socket_result.error());
+        if (!socket_result) {
+            std::cerr << "Failed to create socket\n";
+            return std::unexpected(socket_result.error());
+        }
 
         listen_socket_ = std::move(*socket_result);
+        std::cout << "Socket created, binding to port " << PORT << "...\n";
 
         if (auto result = net::bind(listen_socket_.get(), PORT); !result) {
+            std::cerr << "Failed to bind to port " << PORT << "\n";
             return std::unexpected(result.error());
         }
 
+        std::cout << "Bound to port, listening...\n";
         if (auto result = net::listen(listen_socket_.get(), MAX_CLIENTS); !result) {
+            std::cerr << "Failed to listen\n";
             return std::unexpected(result.error());
         }
 
+        std::cout << "Setting non-blocking mode...\n";
         if (auto result = listen_socket_.set_nonblocking(); !result) {
+            std::cerr << "Failed to set non-blocking\n";
             return std::unexpected(result.error());
         }
 
+        std::cout << "Server started successfully\n";
         return {};
     }
 
     void run() {
+        std::cout << "Server running, accepting connections...\n";
         while (listen_socket_.valid()) {
             std::array<char, 46> ip;
             uint16_t port;
@@ -319,6 +422,7 @@ public:
 
                 auto id = find_free_slot();
                 if (id < MAX_CLIENTS) {
+                    std::cout << "Client connected from " << ip.data() << ":" << port << " (ID: " << static_cast<int>(id) << ")\n";
                     auto session = std::make_unique<ClientSession>(
                         id, std::move(*client_result), std::string{ip.data()}
                     );
@@ -328,6 +432,7 @@ public:
                             session->process();
                             std::this_thread::sleep_for(10ms);
                         }
+                        std::cout << "Client session ended\n";
                     });
 
                     clients_.push_back(std::move(session));
@@ -336,6 +441,7 @@ public:
 
             std::this_thread::sleep_for(10ms);
         }
+        std::cout << "Server stopped\n";
     }
 
 private:
@@ -356,9 +462,12 @@ private:
 } // namespace server
 
 int main(int argc, char* argv[]) {
+    std::cout << "Initializing network...\n";
     if (auto result = net::NetworkManager::instance().init(); !result) {
+        std::cerr << "Network initialization failed\n";
         return 1;
     }
+    std::cout << "Network initialized\n";
 
     // Load protected functions from directory
     std::filesystem::path functions_dir = argc > 1 ? argv[1] : "functions";
@@ -369,9 +478,13 @@ int main(int argc, char* argv[]) {
         // Continue anyway - functions are optional
     }
 
+    std::cout << "Creating server...\n";
     server::GameServer server;
+    std::cout << "Server object created\n";
 
+    std::cout << "Starting server...\n";
     if (auto result = server.start(); !result) {
+        std::cerr << "Server start failed\n";
         return 1;
     }
 

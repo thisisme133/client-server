@@ -32,8 +32,10 @@ enum class PacketType : uint8_t {
     GameSelect,
     PEChunk,
     PEComplete,
-    FunctionRequest,   // Client requests a protected function
-    FunctionResponse   // Server sends function code
+    FunctionRequest,      // Client requests a protected function
+    FunctionResponse,     // Server sends function code
+    HeartbeatChallenge,   // Server sends heartbeat challenge
+    HeartbeatResponse     // Client responds with proof-of-work solution
 };
 
 // Packet flags
@@ -187,6 +189,20 @@ struct PayloadFunctionResponse {
     std::array<char, 64> function_name;  // For collision detection and integrity
     uint32_t checksum;  // Simple integrity check
     std::array<uint8_t, MAX_PAYLOAD_SIZE - 76> code;  // 76 = 8 + 64 + 4
+};
+
+struct PayloadHeartbeatChallenge {
+    uint64_t nonce;
+    uint64_t timestamp;
+    uint32_t difficulty;      // Number of hash iterations
+    uint32_t session_id;
+};
+
+struct PayloadHeartbeatResponse {
+    uint64_t solution;
+    uint64_t client_timestamp;
+    uint32_t client_state_hash;  // Hash of anti-debug/VM checks
+    uint32_t reserved;
 };
 
 // Utilities
