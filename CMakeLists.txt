@@ -1,103 +1,120 @@
-cmake_minimum_required(VERSION 3.10)
-project(tcp_client_server C)
+cmake_minimum_required(VERSION 3.25)
+project(tcp_game_loader_cpp23 CXX)
 
-set(CMAKE_C_STANDARD 99)
+# C++23 standard
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Optimisations pour binaires minimaux
+# Default to Release for maximum performance
 if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE MinSizeRel)
+    set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# Flags de compilation pour réduire la taille
+# Compiler-specific optimizations
 if(MSVC)
-    # Windows MSVC
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /W4 /Os /GS- /GL")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /LTCG /OPT:REF /OPT:ICF")
-    add_definitions(-D_CRT_SECURE_NO_WARNINGS)
-elseif(APPLE)
-    # macOS (Clang avec linker LLVM)
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Os -ffunction-sections -fdata-sections")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-stack-protector -fno-unwind-tables -fno-asynchronous-unwind-tables")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-dead_strip")
+    # MSVC optimizations
+    add_compile_options(
+        /std:c++latest
+        /W4
+        /O2                 # Maximum optimization
+        /Oi                 # Intrinsics
+        /Ot                 # Favor fast code
+        /GL                 # Whole program optimization
+        /GS-                # No security checks (performance)
+        /fp:fast            # Fast floating point
+        /arch:AVX2          # Use AVX2 if available
+        /Zc:__cplusplus     # Correct __cplusplus macro
+    )
+    add_link_options(/LTCG /OPT:REF /OPT:ICF)
+    add_definitions(-D_CRT_SECURE_NO_WARNINGS -DNOMINMAX)
 else()
-    # Linux (GCC/Clang avec linker GNU)
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Os -ffunction-sections -fdata-sections")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-stack-protector -fno-unwind-tables -fno-asynchronous-unwind-tables")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections -Wl,--strip-all")
+    # GCC/Clang optimizations
+    add_compile_options(
+        -std=c++23
+        -Wall -Wextra -Wpedantic
+        -O3                 # Maximum optimization
+        -march=native       # Use all CPU features
+        -mtune=native       # Tune for current CPU
+        -flto               # Link-time optimization
+        -ffast-math         # Fast math operations
+        -funroll-loops      # Unroll loops
+        -finline-functions  # Inline functions
+        -fomit-frame-pointer # Remove frame pointer
+        -fno-exceptions     # No exceptions (performance)
+        -fno-rtti           # No RTTI (performance)
+    )
+    add_link_options(-flto -s)  # Strip symbols
 endif()
 
 # Include directories
-include_directories(${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/common)
+include_directories(${CMAKE_SOURCE_DIR}/include)
 
-# Common library (code partagé)
+# Common library (header-only style for inline optimizations)
+add_library(common_hpp INTERFACE)
+target_include_directories(common_hpp INTERFACE ${CMAKE_SOURCE_DIR}/include)
+
+# Common sources (compiled once, linked to both)
 add_library(common STATIC
-    src/common/network.c
-    src/common/packet.c
-    src/common/compression.c
-    src/common/crc.c
-    src/common/crypto.c
-    src/common/logger.c
-    src/common/command.c
-    src/common/pe_loader.c
+    src/common/network.cpp
+    src/common/packet.cpp
 )
-
-# Server executable
-add_executable(server
-    src/server/server.c
-    src/server/blacklist.c
+target_compile_options(common PRIVATE
+    $<$<CONFIG:Release>:-O3 -march=native>
 )
-target_link_libraries(server common)
 
 # Client executable
 if(WIN32)
     add_executable(client
-        src/client/client.c
-        src/client/anti_debug.c
-        src/client/syscalls.c
+        src/client/client.cpp
+        src/client/syscalls.cpp
     )
+    target_link_libraries(client common ws2_32)
 else()
     add_executable(client
-        src/client/client.c
-        src/client/anti_debug.c
+        src/client/client.cpp
     )
+    target_link_libraries(client common)
 endif()
-target_link_libraries(client common)
 
-# Linking pour Windows (ws2_32)
+# Server executable
+add_executable(server
+    src/server/server.cpp
+)
+target_link_libraries(server common)
+
+# Platform-specific linking
 if(WIN32)
     target_link_libraries(server ws2_32)
-    target_link_libraries(client ws2_32)
 else()
-    # POSIX threads pour Linux/macOS
     find_package(Threads REQUIRED)
-    target_link_libraries(server ${CMAKE_THREAD_LIBS_INIT})
-    target_link_libraries(client ${CMAKE_THREAD_LIBS_INIT})
+    target_link_libraries(server Threads::Threads)
+    target_link_libraries(client Threads::Threads)
 endif()
 
-# Strip les symboles en post-build
-if(UNIX)
-    if(APPLE)
-        # macOS : strip sans -s (non supporté)
-        add_custom_command(TARGET server POST_BUILD
-            COMMAND strip $<TARGET_FILE:server>
-            COMMENT "Stripping server binary"
-        )
-        add_custom_command(TARGET client POST_BUILD
-            COMMAND strip $<TARGET_FILE:client>
-            COMMENT "Stripping client binary"
-        )
-    else()
-        # Linux : strip avec -s
-        add_custom_command(TARGET server POST_BUILD
-            COMMAND strip -s $<TARGET_FILE:server>
-            COMMENT "Stripping server binary"
-        )
-        add_custom_command(TARGET client POST_BUILD
-            COMMAND strip -s $<TARGET_FILE:client>
-            COMMENT "Stripping client binary"
-        )
-    endif()
+# IPO/LTO for maximum performance
+include(CheckIPOSupported)
+check_ipo_supported(RESULT ipo_supported)
+if(ipo_supported)
+    set_property(TARGET client PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    set_property(TARGET server PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    set_property(TARGET common PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
 
-# Tools subdirectory (function patcher, etc.)
-add_subdirectory(tools)
+# Strip binaries in Release mode
+if(UNIX AND NOT APPLE)
+    add_custom_command(TARGET client POST_BUILD
+        COMMAND strip -s $<TARGET_FILE:client>
+        COMMENT "Stripping client binary"
+    )
+    add_custom_command(TARGET server POST_BUILD
+        COMMAND strip -s $<TARGET_FILE:server>
+        COMMENT "Stripping server binary"
+    )
+endif()
+
+# Print build info
+message(STATUS "C++ Standard: ${CMAKE_CXX_STANDARD}")
+message(STATUS "Build Type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+message(STATUS "LTO/IPO: ${ipo_supported}")
