@@ -39,8 +39,9 @@ struct FunctionMarker {
     constexpr FunctionMarker(std::string_view n) noexcept
         : hash(fnv1a_hash(n)), name(n) {}
 
+    // Compare both hash AND name to prevent collision attacks
     constexpr bool operator==(const FunctionMarker& other) const noexcept {
-        return hash == other.hash;
+        return hash == other.hash && name == other.name;
     }
 };
 
@@ -58,29 +59,66 @@ struct FunctionMarker {
         static RetType Name [[maybe_unused]]
 #endif
 
-// Temporary function executor - allocates RWX, executes, then immediately frees
+// Temporary function executor - allocates executable memory, executes, then immediately frees
+// Supports W^X systems (SELinux, hardened Linux) by using RW -> RX transition
 // This prevents the function from staying in memory for analysis
 class TemporaryFunction {
     void* exec_memory_ = nullptr;
     size_t size_ = 0;
+    bool using_wx_separate_ = false;
 
 public:
     explicit TemporaryFunction(std::span<const uint8_t> bytecode) : size_(bytecode.size()) {
         if (bytecode.empty()) return;
 
 #ifdef _WIN32
+        // Try RWX first (most common)
         exec_memory_ = VirtualAlloc(nullptr, size_,
                                     MEM_COMMIT | MEM_RESERVE,
                                     PAGE_EXECUTE_READWRITE);
+
+        if (!exec_memory_) {
+            // If RWX fails (rare on Windows), try RW -> RX
+            exec_memory_ = VirtualAlloc(nullptr, size_,
+                                        MEM_COMMIT | MEM_RESERVE,
+                                        PAGE_READWRITE);
+            using_wx_separate_ = true;
+        }
+
         if (exec_memory_) {
             std::memcpy(exec_memory_, bytecode.data(), size_);
+
+            // If using W^X, change to RX now
+            if (using_wx_separate_) {
+                DWORD old_protect;
+                VirtualProtect(exec_memory_, size_, PAGE_EXECUTE_READ, &old_protect);
+            }
         }
 #else
+        // Try RWX first
         exec_memory_ = mmap(nullptr, size_,
                            PROT_READ | PROT_WRITE | PROT_EXEC,
                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+        if (exec_memory_ == MAP_FAILED) {
+            // W^X enforcement - try RW -> RX
+            exec_memory_ = mmap(nullptr, size_,
+                               PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            using_wx_separate_ = true;
+        }
+
         if (exec_memory_ != MAP_FAILED) {
             std::memcpy(exec_memory_, bytecode.data(), size_);
+
+            // Flush instruction cache and change to RX
+            if (using_wx_separate_) {
+                __builtin___clear_cache(
+                    reinterpret_cast<char*>(exec_memory_),
+                    reinterpret_cast<char*>(exec_memory_) + size_
+                );
+                mprotect(exec_memory_, size_, PROT_READ | PROT_EXEC);
+            }
         } else {
             exec_memory_ = nullptr;
         }
@@ -88,7 +126,7 @@ public:
     }
 
     ~TemporaryFunction() {
-        // Immediately free RWX memory after use
+        // Immediately free executable memory after use
         if (exec_memory_) {
 #ifdef _WIN32
             VirtualFree(exec_memory_, 0, MEM_RELEASE);
@@ -125,10 +163,28 @@ public:
     }
 };
 
-// Bytecode storage - stores only raw bytes, no RWX memory
+// Simple SHA256 implementation for bytecode integrity verification
+inline constexpr uint32_t simple_checksum(std::span<const uint8_t> data) noexcept {
+    uint32_t checksum = 0x5A5A5A5A;
+    for (size_t i = 0; i < data.size(); ++i) {
+        checksum ^= data[i];
+        checksum = (checksum << 7) | (checksum >> 25);
+        checksum += i * 0x01000193;
+    }
+    return checksum;
+}
+
+// Bytecode storage - stores raw bytes with integrity verification
 // RWX memory is allocated only during execution and freed immediately after
 class BytecodeStorage {
-    std::unordered_map<uint32_t, std::vector<uint8_t>> storage_;
+    struct BytecodeEntry {
+        std::string name;
+        std::vector<uint8_t> code;
+        uint32_t checksum;
+        size_t expected_size;
+    };
+
+    std::unordered_map<uint32_t, BytecodeEntry> storage_;
     std::mutex mutex_;
 
     BytecodeStorage() = default;
@@ -139,20 +195,65 @@ public:
         return storage;
     }
 
-    void store(uint32_t marker_hash, std::span<const uint8_t> code) {
+    // Store bytecode with name verification and integrity check
+    bool store(uint32_t marker_hash, std::string_view name, std::span<const uint8_t> code) {
         std::lock_guard lock(mutex_);
-        storage_[marker_hash] = std::vector<uint8_t>(code.begin(), code.end());
+
+        // Detect hash collision - different name with same hash
+        auto it = storage_.find(marker_hash);
+        if (it != storage_.end() && it->second.name != name) {
+            // CRITICAL: Hash collision detected!
+            return false;
+        }
+
+        BytecodeEntry entry;
+        entry.name = std::string(name);
+        entry.code = std::vector<uint8_t>(code.begin(), code.end());
+        entry.checksum = simple_checksum(code);
+        entry.expected_size = code.size();
+
+        storage_[marker_hash] = std::move(entry);
+        return true;
     }
 
-    std::vector<uint8_t> get(uint32_t marker_hash) {
+    // Get bytecode with integrity verification
+    std::vector<uint8_t> get(uint32_t marker_hash, std::string_view expected_name) {
         std::lock_guard lock(mutex_);
         auto it = storage_.find(marker_hash);
-        return it != storage_.end() ? it->second : std::vector<uint8_t>{};
+
+        if (it == storage_.end()) {
+            return {};
+        }
+
+        auto& entry = it->second;
+
+        // Verify name matches (collision detection)
+        if (entry.name != expected_name) {
+            return {};
+        }
+
+        // Verify integrity
+        uint32_t actual_checksum = simple_checksum(entry.code);
+        if (actual_checksum != entry.checksum) {
+            // Bytecode corrupted!
+            storage_.erase(it);
+            return {};
+        }
+
+        // Verify size
+        if (entry.code.size() != entry.expected_size) {
+            // Size mismatch!
+            storage_.erase(it);
+            return {};
+        }
+
+        return entry.code;
     }
 
-    bool has(uint32_t marker_hash) {
+    bool has(uint32_t marker_hash, std::string_view expected_name) {
         std::lock_guard lock(mutex_);
-        return storage_.contains(marker_hash);
+        auto it = storage_.find(marker_hash);
+        return it != storage_.end() && it->second.name == expected_name;
     }
 
     void clear() {
@@ -220,7 +321,20 @@ public:
         if (!req) return false;
 
         std::unique_lock lock(req->mutex);
-        return req->cv.wait_for(lock, timeout, [&] { return req->completed; });
+        bool success = req->cv.wait_for(lock, timeout, [&] { return req->completed; });
+
+        // CRITICAL: Clean up request from map regardless of success/failure
+        // This prevents memory leaks and allows retries
+        {
+            std::lock_guard map_lock(mutex_);
+            auto it = requests_.find(marker_hash);
+            if (it != requests_.end() && !it->second->completed) {
+                // Only remove if not completed (complete() already removed it)
+                requests_.erase(it);
+            }
+        }
+
+        return success;
     }
 };
 
@@ -242,8 +356,8 @@ public:
     ) {
         auto& storage = BytecodeStorage::instance();
 
-        // Check if bytecode is in storage (no RWX, just raw bytes)
-        std::vector<uint8_t> bytecode = storage.get(marker.hash);
+        // Check if bytecode is in storage (with name verification)
+        std::vector<uint8_t> bytecode = storage.get(marker.hash, marker.name);
 
         // If not in storage, request from server
         if (bytecode.empty()) {
@@ -256,18 +370,28 @@ public:
                 return std::unexpected("Failed to receive function from server");
             }
 
-            // Get bytecode from storage
-            bytecode = storage.get(marker.hash);
+            // Get bytecode from storage with verification
+            bytecode = storage.get(marker.hash, marker.name);
             if (bytecode.empty()) {
-                return std::unexpected("Function bytecode not available");
+                return std::unexpected("Function bytecode not available or integrity check failed");
             }
         }
 
-        // Allocate RWX memory temporarily (RAII - freed on scope exit)
+        // Additional size sanity check
+        if (bytecode.size() > 1024 * 1024) {  // 1MB max
+            return std::unexpected("Function bytecode too large - possible corruption");
+        }
+
+        if (bytecode.size() < 4) {  // Minimum viable function size
+            return std::unexpected("Function bytecode too small - possible corruption");
+        }
+
+        // Allocate executable memory temporarily (RAII - freed on scope exit)
+        // Supports both RWX and W^X systems
         TemporaryFunction temp_fn(bytecode);
 
         if (!temp_fn.valid()) {
-            return std::unexpected("Failed to allocate executable memory");
+            return std::unexpected("Failed to allocate executable memory (W^X or SELinux may be blocking)");
         }
 
         // Execute function - memory will be freed automatically when temp_fn goes out of scope

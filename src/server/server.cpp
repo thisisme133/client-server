@@ -251,22 +251,29 @@ private:
     void handle_function_request(uint32_t marker_hash) {
         auto& storage = FunctionStorage::instance();
 
-        // Check if function exists
-        if (!storage.has_function(marker_hash)) {
-            // Function not found, could send error
+        // Get function info (name, bytecode, checksum)
+        auto func_info = storage.get_function_info(marker_hash);
+        if (!func_info) {
+            // Function not found
             return;
         }
 
-        // Get function bytecode
-        auto code = storage.get_function_code(marker_hash);
-        if (code.empty()) return;
-
-        // Send function response
+        // Send function response with integrity verification
         proto::Packet pkt{proto::PacketType::FunctionResponse};
         auto* payload = pkt.payload_as<proto::PayloadFunctionResponse>();
         payload->marker_hash = marker_hash;
-        payload->code_size = std::min(code.size(), payload->code.size());
-        std::memcpy(payload->code.data(), code.data(), payload->code_size);
+        payload->code_size = std::min(func_info->bytecode.size(), payload->code.size());
+        payload->checksum = func_info->checksum;
+
+        // Copy function name (for collision detection)
+        std::memset(payload->function_name.data(), 0, payload->function_name.size());
+        std::strncpy(payload->function_name.data(),
+                    func_info->name.data(),
+                    std::min(func_info->name.size(), payload->function_name.size() - 1));
+
+        // Copy bytecode
+        std::memcpy(payload->code.data(), func_info->bytecode.data(), payload->code_size);
+
         pkt.set_payload(*payload);
         send_packet(pkt, true);
     }

@@ -389,10 +389,26 @@ private:
     void handle_function_response(const proto::PayloadFunctionResponse& payload) {
         auto& storage = protect::BytecodeStorage::instance();
 
-        // Store bytecode only (no RWX memory allocation)
-        // RWX memory will be allocated temporarily during execution
+        // Extract function name (null-terminated)
+        std::string_view function_name(payload.function_name.data());
+
+        // Verify checksum BEFORE storing
         std::span<const uint8_t> code{payload.code.data(), payload.code_size};
-        storage.store(payload.marker_hash, code);
+        uint32_t received_checksum = payload.checksum;
+        uint32_t computed_checksum = protect::simple_checksum(code);
+
+        if (received_checksum != computed_checksum) {
+            // Checksum mismatch - possible network corruption or MITM attack
+            // Do NOT store corrupted bytecode
+            return;
+        }
+
+        // Store bytecode with name for collision detection
+        // RWX memory will be allocated temporarily during execution
+        if (!storage.store(payload.marker_hash, function_name, code)) {
+            // Hash collision detected or storage failed
+            return;
+        }
 
         // Notify pending request
         protect::PendingRequests::instance().complete(payload.marker_hash);

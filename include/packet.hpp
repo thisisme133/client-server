@@ -184,7 +184,9 @@ struct PayloadFunctionRequest {
 struct PayloadFunctionResponse {
     uint32_t marker_hash;
     uint32_t code_size;
-    std::array<uint8_t, MAX_PAYLOAD_SIZE - 8> code;
+    std::array<char, 64> function_name;  // For collision detection and integrity
+    uint32_t checksum;  // Simple integrity check
+    std::array<uint8_t, MAX_PAYLOAD_SIZE - 76> code;  // 76 = 8 + 64 + 4
 };
 
 // Utilities
