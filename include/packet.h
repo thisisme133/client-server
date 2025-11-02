@@ -7,23 +7,15 @@
 typedef enum {
     PKT_CONNECT = 0,
     PKT_DISCONNECT = 1,
-    PKT_PING = 2,
-    PKT_PONG = 3,
-    PKT_DATA = 4,
+    PKT_CHALLENGE = 2,
+    PKT_CHALLENGE_RESPONSE = 3,
+    PKT_SESSION_KEY = 4,
     PKT_ACK = 5,
     PKT_ERROR = 6,
-    PKT_HEARTBEAT = 7,
-    PKT_CHALLENGE = 8,
-    PKT_SESSION_KEY = 9,
-    PKT_MODULE_LIST = 10,
-    PKT_GAME_SELECT = 11,
-    PKT_PE_METADATA = 12,
-    PKT_PE_IMPORTS = 13,
-    PKT_PE_BASE_ADDR = 14,
-    PKT_PE_IMAGE = 15,
-    PKT_PE_COMPLETE = 16,
-    PKT_FUNCTION_REQUEST = 17,
-    PKT_FUNCTION_RESPONSE = 18
+    PKT_GAME_LIST = 7,
+    PKT_GAME_SELECT = 8,
+    PKT_PE_CHUNK = 9,
+    PKT_PE_COMPLETE = 10
 } packet_type_t;
 
 /* Header de packet avec CRC - 8 bytes total */
@@ -75,64 +67,44 @@ typedef struct __attribute__((packed)) {
 
 typedef struct __attribute__((packed)) {
     uint32_t challenge;
+    uint32_t timestamp;
 } payload_challenge_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t challenge_solution;
+    uint8_t is_debugged;         /* 1 si debugger détecté */
+    uint8_t is_vm;               /* 1 si VM détectée */
+    uint8_t is_suspended;        /* 1 si processus suspendu */
+} payload_challenge_response_t;
 
 typedef struct __attribute__((packed)) {
     uint8_t key[32];
 } payload_session_key_t;
 
-/* PE Loading payloads */
 typedef struct __attribute__((packed)) {
-    uint8_t count;           /* Nombre de modules */
-    char modules[32][128];   /* Liste des noms de DLL */
-} payload_module_list_t;
+    uint8_t count;           /* Nombre de jeux */
+    char games[16][64];      /* Liste des jeux */
+} payload_game_list_t;
 
 typedef struct __attribute__((packed)) {
-    uint32_t module_id;      /* Identifiant du module */
+    uint32_t game_id;        /* ID du jeu sélectionné */
+    char target_process[64]; /* Nom du processus cible (ex: cs2.exe) */
 } payload_game_select_t;
 
 typedef struct __attribute__((packed)) {
-    uint32_t image_size;     /* SizeOfImage */
-    uint32_t entry_rva;      /* RVA du point d'entrée */
-    uint32_t imports_size;   /* Taille du buffer d'imports */
-    uint8_t is_64bit;        /* 1 si PE64, 0 si PE32 */
-    char dll_name[128];      /* Nom de la DLL */
-} payload_pe_metadata_t;
-
-typedef struct __attribute__((packed)) {
-    uint32_t offset;         /* Offset dans le buffer total */
-    uint32_t total_size;     /* Taille totale du buffer */
-    uint16_t chunk_size;     /* Taille de ce chunk */
-    uint8_t data[MAX_PAYLOAD_SIZE - 10];
-} payload_pe_imports_t;
-
-typedef struct __attribute__((packed)) {
-    uint64_t base_address;   /* Adresse de base allouée */
-} payload_pe_base_addr_t;
-
-typedef struct __attribute__((packed)) {
-    uint32_t offset;         /* Offset dans l'image totale */
+    uint32_t chunk_index;    /* Index du chunk */
+    uint32_t total_chunks;   /* Nombre total de chunks */
+    uint32_t chunk_size;     /* Taille de ce chunk */
     uint32_t total_size;     /* Taille totale de l'image */
-    uint16_t chunk_size;     /* Taille de ce chunk */
-    uint8_t data[MAX_PAYLOAD_SIZE - 10];
-} payload_pe_image_t;
+    uint32_t entry_rva;      /* RVA du point d'entrée (dans le 1er chunk) */
+    uint8_t data[MAX_PAYLOAD_SIZE - 20];
+} payload_pe_chunk_t;
 
 typedef struct __attribute__((packed)) {
     uint8_t success;         /* 1 si succès, 0 sinon */
     uint32_t thread_id;      /* ID du thread créé */
+    uint64_t base_address;   /* Adresse où le PE a été mappé */
 } payload_pe_complete_t;
-
-/* Protected function request/response */
-typedef struct __attribute__((packed)) {
-    char function_name[256]; /* Nom de la fonction demandée */
-} payload_function_request_t;
-
-typedef struct __attribute__((packed)) {
-    char function_name[256]; /* Nom de la fonction */
-    uint32_t size;           /* Taille des bytes */
-    uint8_t success;         /* 1 si trouvée, 0 sinon */
-    uint8_t data[MAX_PAYLOAD_SIZE - 261];  /* Bytes de la fonction */
-} payload_function_response_t;
 
 /* Fonctions de création de packets */
 void pkt_init(packet_t* pkt, uint8_t type);

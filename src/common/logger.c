@@ -33,23 +33,15 @@ static const char* get_packet_type_name(uint8_t type) {
     switch (type) {
         case PKT_CONNECT: return "CONNECT";
         case PKT_DISCONNECT: return "DISCONNECT";
-        case PKT_PING: return "PING";
-        case PKT_PONG: return "PONG";
-        case PKT_DATA: return "DATA";
+        case PKT_CHALLENGE: return "CHALLENGE";
+        case PKT_CHALLENGE_RESPONSE: return "CHALLENGE_RESPONSE";
+        case PKT_SESSION_KEY: return "SESSION_KEY";
         case PKT_ACK: return "ACK";
         case PKT_ERROR: return "ERROR";
-        case PKT_HEARTBEAT: return "HEARTBEAT";
-        case PKT_CHALLENGE: return "CHALLENGE";
-        case PKT_SESSION_KEY: return "SESSION_KEY";
-        case PKT_MODULE_LIST: return "MODULE_LIST";
+        case PKT_GAME_LIST: return "GAME_LIST";
         case PKT_GAME_SELECT: return "GAME_SELECT";
-        case PKT_PE_METADATA: return "PE_METADATA";
-        case PKT_PE_IMPORTS: return "PE_IMPORTS";
-        case PKT_PE_BASE_ADDR: return "PE_BASE_ADDR";
-        case PKT_PE_IMAGE: return "PE_IMAGE";
+        case PKT_PE_CHUNK: return "PE_CHUNK";
         case PKT_PE_COMPLETE: return "PE_COMPLETE";
-        case PKT_FUNCTION_REQUEST: return "FUNCTION_REQUEST";
-        case PKT_FUNCTION_RESPONSE: return "FUNCTION_RESPONSE";
         default: return "UNKNOWN";
     }
 }
@@ -199,15 +191,6 @@ void log_packet(log_direction_t direction, const packet_t* pkt, const char* peer
 
         /* Décoder selon le type */
         switch (pkt->header.type) {
-            case PKT_HEARTBEAT: {
-                payload_heartbeat_t hb;
-                uint16_t size;
-                pkt_get_payload(pkt, &hb, &size);
-                log_field(2, "Sequence", "%u", hb.sequence);
-                log_field(2, "Challenge Response", "0x%08X", hb.challenge_response);
-                break;
-            }
-
             case PKT_CHALLENGE: {
                 payload_challenge_t ch;
                 uint16_t size;

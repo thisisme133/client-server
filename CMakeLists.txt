@@ -51,6 +51,7 @@ target_link_libraries(server common)
 # Client executable
 add_executable(client
     src/client/client.c
+    src/client/anti_debug.c
 )
 target_link_libraries(client common)
 
