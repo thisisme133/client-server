@@ -49,10 +49,18 @@ add_executable(server
 target_link_libraries(server common)
 
 # Client executable
-add_executable(client
-    src/client/client.c
-    src/client/anti_debug.c
-)
+if(WIN32)
+    add_executable(client
+        src/client/client.c
+        src/client/anti_debug.c
+        src/client/syscalls.c
+    )
+else()
+    add_executable(client
+        src/client/client.c
+        src/client/anti_debug.c
+    )
+endif()
 target_link_libraries(client common)
 
 # Linking pour Windows (ws2_32)
