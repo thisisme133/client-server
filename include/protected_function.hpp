@@ -58,105 +58,106 @@ struct FunctionMarker {
         static RetType Name [[maybe_unused]]
 #endif
 
-// Function bytecode wrapper
-struct FunctionCode {
-    std::vector<uint8_t> code;
-    size_t code_size = 0;
-    void* exec_memory = nullptr;
+// Temporary function executor - allocates RWX, executes, then immediately frees
+// This prevents the function from staying in memory for analysis
+class TemporaryFunction {
+    void* exec_memory_ = nullptr;
+    size_t size_ = 0;
 
-    FunctionCode() = default;
-
-    explicit FunctionCode(std::span<const uint8_t> bytes)
-        : code(bytes.begin(), bytes.end()), code_size(bytes.size()) {
-        allocate_executable();
-    }
-
-    ~FunctionCode() {
-        if (exec_memory) {
-#ifdef _WIN32
-            VirtualFree(exec_memory, 0, MEM_RELEASE);
-#else
-            munmap(exec_memory, code_size);
-#endif
-        }
-    }
-
-    FunctionCode(const FunctionCode&) = delete;
-    FunctionCode& operator=(const FunctionCode&) = delete;
-
-    FunctionCode(FunctionCode&& other) noexcept
-        : code(std::move(other.code))
-        , code_size(other.code_size)
-        , exec_memory(other.exec_memory) {
-        other.exec_memory = nullptr;
-    }
-
-    void allocate_executable() {
-        if (code.empty()) return;
+public:
+    explicit TemporaryFunction(std::span<const uint8_t> bytecode) : size_(bytecode.size()) {
+        if (bytecode.empty()) return;
 
 #ifdef _WIN32
-        exec_memory = VirtualAlloc(nullptr, code.size(),
-                                   MEM_COMMIT | MEM_RESERVE,
-                                   PAGE_EXECUTE_READWRITE);
-        if (exec_memory) {
-            std::memcpy(exec_memory, code.data(), code.size());
+        exec_memory_ = VirtualAlloc(nullptr, size_,
+                                    MEM_COMMIT | MEM_RESERVE,
+                                    PAGE_EXECUTE_READWRITE);
+        if (exec_memory_) {
+            std::memcpy(exec_memory_, bytecode.data(), size_);
         }
 #else
-        exec_memory = mmap(nullptr, code.size(),
-                          PROT_READ | PROT_WRITE | PROT_EXEC,
-                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (exec_memory != MAP_FAILED) {
-            std::memcpy(exec_memory, code.data(), code.size());
+        exec_memory_ = mmap(nullptr, size_,
+                           PROT_READ | PROT_WRITE | PROT_EXEC,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (exec_memory_ != MAP_FAILED) {
+            std::memcpy(exec_memory_, bytecode.data(), size_);
         } else {
-            exec_memory = nullptr;
+            exec_memory_ = nullptr;
         }
 #endif
     }
+
+    ~TemporaryFunction() {
+        // Immediately free RWX memory after use
+        if (exec_memory_) {
+#ifdef _WIN32
+            VirtualFree(exec_memory_, 0, MEM_RELEASE);
+#else
+            munmap(exec_memory_, size_);
+#endif
+            exec_memory_ = nullptr;
+        }
+    }
+
+    TemporaryFunction(const TemporaryFunction&) = delete;
+    TemporaryFunction& operator=(const TemporaryFunction&) = delete;
+    TemporaryFunction(TemporaryFunction&&) = delete;
 
     template<typename Ret, typename... Args>
-    Ret invoke(Args&&... args) const {
+    Ret execute(Args&&... args) const {
+        if (!exec_memory_) {
+            if constexpr (std::is_same_v<Ret, bool>) {
+                return false;
+            } else if constexpr (std::is_arithmetic_v<Ret>) {
+                return static_cast<Ret>(0);
+            } else {
+                return Ret{};
+            }
+        }
+
         using FnPtr = Ret(*)(Args...);
-        auto fn = reinterpret_cast<FnPtr>(exec_memory);
+        auto fn = reinterpret_cast<FnPtr>(exec_memory_);
         return fn(std::forward<Args>(args)...);
     }
 
     [[nodiscard]] bool valid() const noexcept {
-        return exec_memory != nullptr;
+        return exec_memory_ != nullptr;
     }
 };
 
-// Function cache
-class FunctionCache {
-    std::unordered_map<uint32_t, std::unique_ptr<FunctionCode>> cache_;
+// Bytecode storage - stores only raw bytes, no RWX memory
+// RWX memory is allocated only during execution and freed immediately after
+class BytecodeStorage {
+    std::unordered_map<uint32_t, std::vector<uint8_t>> storage_;
     std::mutex mutex_;
 
-    FunctionCache() = default;
+    BytecodeStorage() = default;
 
 public:
-    static FunctionCache& instance() {
-        static FunctionCache cache;
-        return cache;
+    static BytecodeStorage& instance() {
+        static BytecodeStorage storage;
+        return storage;
     }
 
     void store(uint32_t marker_hash, std::span<const uint8_t> code) {
         std::lock_guard lock(mutex_);
-        cache_[marker_hash] = std::make_unique<FunctionCode>(code);
+        storage_[marker_hash] = std::vector<uint8_t>(code.begin(), code.end());
     }
 
-    FunctionCode* get(uint32_t marker_hash) {
+    std::vector<uint8_t> get(uint32_t marker_hash) {
         std::lock_guard lock(mutex_);
-        auto it = cache_.find(marker_hash);
-        return it != cache_.end() ? it->second.get() : nullptr;
+        auto it = storage_.find(marker_hash);
+        return it != storage_.end() ? it->second : std::vector<uint8_t>{};
     }
 
     bool has(uint32_t marker_hash) {
         std::lock_guard lock(mutex_);
-        return cache_.contains(marker_hash);
+        return storage_.contains(marker_hash);
     }
 
     void clear() {
         std::lock_guard lock(mutex_);
-        cache_.clear();
+        storage_.clear();
     }
 };
 
@@ -239,33 +240,38 @@ public:
     static std::expected<Ret, std::string_view> Call(
         FunctionMarker marker, Args&&... args
     ) {
-        auto& cache = FunctionCache::instance();
+        auto& storage = BytecodeStorage::instance();
 
-        // Check if function is already in cache
-        if (auto* fn_code = cache.get(marker.hash)) {
-            if (fn_code->valid()) {
-                return fn_code->invoke<Ret>(std::forward<Args>(args)...);
+        // Check if bytecode is in storage (no RWX, just raw bytes)
+        std::vector<uint8_t> bytecode = storage.get(marker.hash);
+
+        // If not in storage, request from server
+        if (bytecode.empty()) {
+            if (!requester_) {
+                return std::unexpected("No function requester set");
+            }
+
+            // Request function and wait for response
+            if (!request_and_wait(marker.hash)) {
+                return std::unexpected("Failed to receive function from server");
+            }
+
+            // Get bytecode from storage
+            bytecode = storage.get(marker.hash);
+            if (bytecode.empty()) {
+                return std::unexpected("Function bytecode not available");
             }
         }
 
-        // Function not in cache, request from server
-        if (!requester_) {
-            return std::unexpected("No function requester set");
+        // Allocate RWX memory temporarily (RAII - freed on scope exit)
+        TemporaryFunction temp_fn(bytecode);
+
+        if (!temp_fn.valid()) {
+            return std::unexpected("Failed to allocate executable memory");
         }
 
-        // Request function and wait for response
-        if (!request_and_wait(marker.hash)) {
-            return std::unexpected("Failed to receive function from server");
-        }
-
-        // Try again from cache
-        if (auto* fn_code = cache.get(marker.hash)) {
-            if (fn_code->valid()) {
-                return fn_code->invoke<Ret>(std::forward<Args>(args)...);
-            }
-        }
-
-        return std::unexpected("Function execution failed");
+        // Execute function - memory will be freed automatically when temp_fn goes out of scope
+        return temp_fn.execute<Ret>(std::forward<Args>(args)...);
     }
 
 private:

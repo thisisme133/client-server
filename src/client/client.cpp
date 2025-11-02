@@ -387,11 +387,12 @@ private:
     }
 
     void handle_function_response(const proto::PayloadFunctionResponse& payload) {
-        auto& cache = protect::FunctionCache::instance();
+        auto& storage = protect::BytecodeStorage::instance();
 
-        // Store function in cache
+        // Store bytecode only (no RWX memory allocation)
+        // RWX memory will be allocated temporarily during execution
         std::span<const uint8_t> code{payload.code.data(), payload.code_size};
-        cache.store(payload.marker_hash, code);
+        storage.store(payload.marker_hash, code);
 
         // Notify pending request
         protect::PendingRequests::instance().complete(payload.marker_hash);
