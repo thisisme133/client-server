@@ -2,6 +2,8 @@
 #define SYSCALLS_H
 
 #include <stdint.h>
+
+#ifdef _WIN32
 #include <windows.h>
 
 /* Structures NT natives */
@@ -44,25 +46,32 @@ typedef struct _CLIENT_ID {
 #define PROCESS_ALL_ACCESS     0x1F0FFF
 #define THREAD_ALL_ACCESS      0x1F03FF
 
-/* Syscall numbers (Windows 10 x64) */
+/* Shellcode pour syscall direct (x64) */
 typedef struct {
-    uint16_t NtAllocateVirtualMemory;
-    uint16_t NtWriteVirtualMemory;
-    uint16_t NtProtectVirtualMemory;
-    uint16_t NtCreateThreadEx;
-    uint16_t NtOpenProcess;
-    uint16_t NtClose;
-} syscall_table_t;
+    uint8_t shellcode[13];  /* mov r10,rcx; mov rax,SSN; syscall; ret */
+    void* exec_memory;      /* Mémoire RWX allouée */
+    uint32_t ssn;           /* System Service Number */
+    uint8_t initialized;
+} syscall_stub_t;
 
-/* Global syscall table */
-extern syscall_table_t g_syscall_table;
+/* Cache pour les SSN */
+typedef struct {
+    const char* name;
+    uint32_t ssn;
+} ssn_cache_entry_t;
+
+#define MAX_SSN_CACHE 32
 
 /* Fonctions d'initialisation */
 int syscalls_init(void);
 void syscalls_cleanup(void);
 
-/* Wrappers des syscalls directs */
-NTSTATUS syscall_NtAllocateVirtualMemory(
+/* API bas niveau : préparer un stub syscall */
+int syscall_prepare(syscall_stub_t* stub, const char* function_name);
+void syscall_cleanup_stub(syscall_stub_t* stub);
+
+/* Wrappers haut niveau pour les syscalls courants */
+NTSTATUS nt_allocate_virtual_memory(
     HANDLE ProcessHandle,
     PVOID* BaseAddress,
     ULONG_PTR ZeroBits,
@@ -71,7 +80,7 @@ NTSTATUS syscall_NtAllocateVirtualMemory(
     ULONG Protect
 );
 
-NTSTATUS syscall_NtWriteVirtualMemory(
+NTSTATUS nt_write_virtual_memory(
     HANDLE ProcessHandle,
     PVOID BaseAddress,
     PVOID Buffer,
@@ -79,7 +88,7 @@ NTSTATUS syscall_NtWriteVirtualMemory(
     PSIZE_T NumberOfBytesWritten
 );
 
-NTSTATUS syscall_NtProtectVirtualMemory(
+NTSTATUS nt_protect_virtual_memory(
     HANDLE ProcessHandle,
     PVOID* BaseAddress,
     PSIZE_T RegionSize,
@@ -87,7 +96,7 @@ NTSTATUS syscall_NtProtectVirtualMemory(
     PULONG OldProtect
 );
 
-NTSTATUS syscall_NtCreateThreadEx(
+NTSTATUS nt_create_thread_ex(
     PHANDLE ThreadHandle,
     ACCESS_MASK DesiredAccess,
     POBJECT_ATTRIBUTES ObjectAttributes,
@@ -101,19 +110,19 @@ NTSTATUS syscall_NtCreateThreadEx(
     PVOID AttributeList
 );
 
-NTSTATUS syscall_NtOpenProcess(
+NTSTATUS nt_open_process(
     PHANDLE ProcessHandle,
     ACCESS_MASK DesiredAccess,
     POBJECT_ATTRIBUTES ObjectAttributes,
     PCLIENT_ID ClientId
 );
 
-NTSTATUS syscall_NtClose(
-    HANDLE Handle
-);
+NTSTATUS nt_close(HANDLE Handle);
 
 /* Macros pour vérifier les NTSTATUS */
 #define NT_SUCCESS(Status) ((NTSTATUS)(Status) >= 0)
 #define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
+
+#endif /* _WIN32 */
 
 #endif /* SYSCALLS_H */

