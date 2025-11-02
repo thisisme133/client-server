@@ -348,9 +348,18 @@ private:
 
 } // namespace server
 
-int main() {
+int main(int argc, char* argv[]) {
     if (auto result = net::NetworkManager::instance().init(); !result) {
         return 1;
+    }
+
+    // Load protected functions from directory
+    std::filesystem::path functions_dir = argc > 1 ? argv[1] : "functions";
+    std::cout << "Loading protected functions from: " << functions_dir << "\n";
+
+    if (!server::FunctionStorage::instance().load_from_directory(functions_dir)) {
+        std::cerr << "Warning: No protected functions loaded\n";
+        // Continue anyway - functions are optional
     }
 
     server::GameServer server;
@@ -359,6 +368,7 @@ int main() {
         return 1;
     }
 
+    std::cout << "Server listening on port " << server::PORT << "\n";
     server.run();
 
     return 0;

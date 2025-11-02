@@ -114,6 +114,19 @@ if(UNIX AND NOT APPLE)
     )
 endif()
 
+# Function patcher tool (Windows only)
+if(WIN32)
+    add_executable(function_patcher
+        tools/function_patcher.cpp
+    )
+    target_link_libraries(function_patcher dbghelp)
+    target_compile_features(function_patcher PRIVATE cxx_std_23)
+
+    if(ipo_supported)
+        set_property(TARGET function_patcher PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif()
+endif()
+
 # Print build info
 message(STATUS "C++ Standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "Build Type: ${CMAKE_BUILD_TYPE}")
