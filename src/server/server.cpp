@@ -42,7 +42,7 @@ struct GameInfo {
 };
 
 class ClientSession {
-    net::Socket socket_;
+    net::socket_wrapper_t socket_;
     uint8_t id_;
     bool authenticated_ = false;
     std::array<uint8_t, proto::SESSION_KEY_SIZE> session_key_{};
@@ -56,7 +56,7 @@ class ClientSession {
     // TODO: Add reconnection token for session resumption
 
 public:
-    explicit ClientSession(uint8_t id, net::Socket socket, std::string ip)
+    explicit ClientSession(uint8_t id, net::socket_wrapper_t socket, std::string ip)
         : socket_(std::move(socket)), id_(id), ip_(std::move(ip)) {
 
         socket_.set_nonblocking();
@@ -71,7 +71,7 @@ public:
 
         auto received = socket_.recv(buffer);
         if (!received) {
-            if (received.error() != net::Error::WouldBlock) {
+            if (received.error() != net::error_t::would_block) {
                 socket_ = {};
             }
             return;
@@ -84,8 +84,8 @@ public:
 
 private:
     void send_challenge() {
-        proto::Packet pkt{proto::PacketType::Challenge};
-        auto* payload = pkt.payload_as<proto::PayloadChallenge>();
+        proto::packet_t pkt{proto::packet_type_t::challenge};
+        auto* payload = pkt.payload_as<proto::payload_challenge_t>();
 
         challenge_ = static_cast<uint32_t>(std::random_device{}());
         payload->challenge = challenge_;
@@ -95,7 +95,7 @@ private:
         send_packet(pkt, false);
     }
 
-    void send_packet(const proto::Packet& pkt, bool encrypt) {
+    void send_packet(const proto::packet_t& pkt, bool encrypt) {
         std::array<uint8_t, proto::MAX_PACKET_SIZE> buffer;
         uint16_t size = pkt.serialize(buffer);
 
@@ -109,25 +109,25 @@ private:
 
         while (offset < data.size()) {
             auto remaining = data.subspan(offset);
-            auto packet_result = proto::Packet::deserialize(remaining);
+            auto packet_result = proto::packet_t::deserialize(remaining);
 
             if (!packet_result) break;
 
             handle_packet(*packet_result);
-            offset += sizeof(proto::PacketHeader) + packet_result->length();
+            offset += sizeof(proto::packet_header_t) + packet_result->length();
         }
     }
 
-    void handle_packet(proto::Packet& packet) {
-        using enum proto::PacketType;
+    void handle_packet(proto::packet_t& packet) {
+        using enum proto::packet_type_t;
 
-        if (packet.has_flag(proto::PacketFlags::Encrypted) && authenticated_) {
+        if (packet.has_flag(proto::packet_flags_t::encrypted) && authenticated_) {
             crypto::decrypt(session_key_, packet.payload_view(), packet.payload_view());
         }
 
         switch (packet.type()) {
-            case ChallengeResponse: {
-                auto* payload = packet.payload_as<proto::PayloadChallengeResponse>();
+            case challenge_response: {
+                auto* payload = packet.payload_as<proto::payload_challenge_response_t>();
 
                 // TODO: Add challenge timeout verification (reject if too slow/fast)
                 // TODO: Add challenge replay protection (store used challenges)
@@ -155,20 +155,20 @@ private:
                 break;
             }
 
-            case Connect: {
+            case connect: {
                 authenticated_ = true;
                 send_game_list();
                 break;
             }
 
-            case GameSelect: {
-                auto* payload = packet.payload_as<proto::PayloadGameSelect>();
+            case game_select: {
+                auto* payload = packet.payload_as<proto::payload_game_select_t>();
                 handle_game_select(payload->game_id);
                 break;
             }
 
-            case FunctionRequest: {
-                auto* payload = packet.payload_as<proto::PayloadFunctionRequest>();
+            case function_request: {
+                auto* payload = packet.payload_as<proto::payload_function_request_t>();
                 handle_function_request(payload->marker_hash);
                 break;
             }
@@ -179,8 +179,8 @@ private:
     }
 
     void send_session_key() {
-        proto::Packet pkt{proto::PacketType::SessionKey};
-        auto* payload = pkt.payload_as<proto::PayloadSessionKey>();
+        proto::packet_t pkt{proto::packet_type_t::session_key};
+        auto* payload = pkt.payload_as<proto::payload_session_key_t>();
 
         std::random_device rd;
         std::generate(session_key_.begin(), session_key_.end(), [&rd] { return static_cast<uint8_t>(rd()); });
@@ -191,8 +191,8 @@ private:
     }
 
     void send_game_list() {
-        proto::Packet pkt{proto::PacketType::GameList};
-        auto* payload = pkt.payload_as<proto::PayloadGameList>();
+        proto::packet_t pkt{proto::packet_type_t::game_list};
+        auto* payload = pkt.payload_as<proto::payload_game_list_t>();
 
         payload->count = 3;
         std::strcpy(payload->games[0].data(), "Counter-Strike 2");
@@ -227,8 +227,8 @@ private:
         size_t chunk_size = (pe_data.size() + PE_CHUNK_COUNT - 1) / PE_CHUNK_COUNT;
 
         for (size_t i = 0; i < PE_CHUNK_COUNT; ++i) {
-            proto::Packet pkt{proto::PacketType::PEChunk};
-            auto* payload = pkt.payload_as<proto::PayloadPEChunk>();
+            proto::packet_t pkt{proto::packet_type_t::pe_chunk};
+            auto* payload = pkt.payload_as<proto::payload_pe_chunk_t>();
 
             payload->chunk_index = i;
             payload->total_chunks = PE_CHUNK_COUNT;
@@ -249,7 +249,7 @@ private:
     }
 
     void handle_function_request(uint32_t marker_hash) {
-        auto& storage = FunctionStorage::instance();
+        auto& storage = function_storage_t::instance();
 
         // Get function info (name, bytecode, checksum)
         auto func_info = storage.get_function_info(marker_hash);
@@ -259,8 +259,8 @@ private:
         }
 
         // Send function response with integrity verification
-        proto::Packet pkt{proto::PacketType::FunctionResponse};
-        auto* payload = pkt.payload_as<proto::PayloadFunctionResponse>();
+        proto::packet_t pkt{proto::packet_type_t::function_response};
+        auto* payload = pkt.payload_as<proto::payload_function_response_t>();
         payload->marker_hash = marker_hash;
         payload->code_size = std::min(func_info->bytecode.size(), payload->code.size());
         payload->checksum = func_info->checksum;
@@ -280,13 +280,13 @@ private:
 };
 
 class GameServer {
-    net::Socket listen_socket_;
+    net::socket_wrapper_t listen_socket_;
     std::vector<std::unique_ptr<ClientSession>> clients_;
     std::vector<std::jthread> client_threads_;
     std::mutex clients_mutex_;
 
 public:
-    [[nodiscard]] auto start() -> std::expected<void, net::Error> {
+    [[nodiscard]] auto start() -> std::expected<void, net::error_t> {
         auto socket_result = net::create_socket();
         if (!socket_result) return std::unexpected(socket_result.error());
 
@@ -356,7 +356,7 @@ private:
 } // namespace server
 
 int main(int argc, char* argv[]) {
-    if (auto result = net::NetworkManager::instance().init(); !result) {
+    if (auto result = net::network_manager_t::instance().init(); !result) {
         return 1;
     }
 
@@ -364,7 +364,7 @@ int main(int argc, char* argv[]) {
     std::filesystem::path functions_dir = argc > 1 ? argv[1] : "functions";
     std::cout << "Loading protected functions from: " << functions_dir << "\n";
 
-    if (!server::FunctionStorage::instance().load_from_directory(functions_dir)) {
+    if (!server::function_storage_t::instance().load_from_directory(functions_dir)) {
         std::cerr << "Warning: No protected functions loaded\n";
         // Continue anyway - functions are optional
     }

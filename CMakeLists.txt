@@ -58,7 +58,6 @@ target_include_directories(common_hpp INTERFACE ${CMAKE_SOURCE_DIR}/include)
 add_library(common STATIC
     src/common/network.cpp
     src/common/packet.cpp
-    src/common/protected_function.cpp
 )
 target_compile_options(common PRIVATE
     $<$<CONFIG:Release>:-O3 -march=native>
