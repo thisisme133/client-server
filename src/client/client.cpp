@@ -2,6 +2,7 @@
 #include "packet.hpp"
 #include "crypto.hpp"
 #include "compression.hpp"
+#include "protected_functions.hpp"
 
 #ifdef _WIN32
 #include "syscalls.hpp"
@@ -241,6 +242,175 @@ namespace client
 	public:
 		virtual ~function_requester_t( ) = default;
 		virtual auto request_function( uint32_t marker_hash ) -> bool = 0;
+	};
+
+	/**
+	 * @brief global protected function caller
+	 */
+	class protected_function_caller_t
+	{
+		static inline function_requester_t* m_requester{ nullptr };
+
+	public:
+		/**
+		 * @brief set function requester
+		 * @param req requester instance
+		 */
+		static auto set_requester( function_requester_t* req ) -> void
+		{
+			m_requester = req;
+		}
+
+		/**
+		 * @brief call protected function
+		 * @tparam Ret return type
+		 * @tparam Args argument types
+		 * @param marker function marker
+		 * @param args function arguments
+		 * @return function result or default value on error
+		 */
+		template<typename Ret, typename... Args>
+		static auto call( protect::function_marker_t marker, Args&&... args ) -> Ret
+		{
+			auto& storage{ bytecode_storage_t::instance( ) };
+
+			/*
+			   check if bytecode is in storage
+			*/
+			std::vector<uint8_t> bytecode{ storage.get( marker.hash, marker.name ) };
+
+			/*
+			   if not in storage, request from server
+			*/
+			if ( bytecode.empty( ) )
+			{
+				if ( !m_requester )
+				{
+					if constexpr ( std::is_same_v<Ret, bool> )
+					{
+						return false;
+					}
+					else if constexpr ( std::is_arithmetic_v<Ret> )
+					{
+						return static_cast<Ret>( 0 );
+					}
+					else
+					{
+						return Ret{ };
+					}
+				}
+
+				/*
+				   add pending request
+				*/
+				auto& pending{ pending_requests_t::instance( ) };
+				auto req{ pending.add( marker.hash ) };
+
+				/*
+				   request function from server
+				*/
+				if ( !m_requester->request_function( marker.hash ) )
+				{
+					pending.remove( marker.hash );
+					if constexpr ( std::is_same_v<Ret, bool> )
+					{
+						return false;
+					}
+					else if constexpr ( std::is_arithmetic_v<Ret> )
+					{
+						return static_cast<Ret>( 0 );
+					}
+					else
+					{
+						return Ret{ };
+					}
+				}
+
+				/*
+				   wait for response (5 seconds timeout)
+				*/
+				if ( !pending.wait_for( marker.hash, std::chrono::seconds( 5 ) ) )
+				{
+					if constexpr ( std::is_same_v<Ret, bool> )
+					{
+						return false;
+					}
+					else if constexpr ( std::is_arithmetic_v<Ret> )
+					{
+						return static_cast<Ret>( 0 );
+					}
+					else
+					{
+						return Ret{ };
+					}
+				}
+
+				/*
+				   get bytecode from storage
+				*/
+				bytecode = storage.get( marker.hash, marker.name );
+				if ( bytecode.empty( ) )
+				{
+					if constexpr ( std::is_same_v<Ret, bool> )
+					{
+						return false;
+					}
+					else if constexpr ( std::is_arithmetic_v<Ret> )
+					{
+						return static_cast<Ret>( 0 );
+					}
+					else
+					{
+						return Ret{ };
+					}
+				}
+			}
+
+			/*
+			   sanity checks
+			*/
+			if ( bytecode.size( ) > 1024 * 1024 || bytecode.size( ) < 4 )
+			{
+				if constexpr ( std::is_same_v<Ret, bool> )
+				{
+					return false;
+				}
+				else if constexpr ( std::is_arithmetic_v<Ret> )
+				{
+					return static_cast<Ret>( 0 );
+				}
+				else
+				{
+					return Ret{ };
+				}
+			}
+
+			/*
+			   allocate executable memory temporarily (RAII - freed on scope exit)
+			*/
+			protect::temporary_function_t temp_fn{ bytecode };
+
+			if ( !temp_fn.valid( ) )
+			{
+				if constexpr ( std::is_same_v<Ret, bool> )
+				{
+					return false;
+				}
+				else if constexpr ( std::is_arithmetic_v<Ret> )
+				{
+					return static_cast<Ret>( 0 );
+				}
+				else
+				{
+					return Ret{ };
+				}
+			}
+
+			/*
+			   execute function - memory will be freed automatically
+			*/
+			return temp_fn.execute<Ret>( std::forward<Args>( args )... );
+		}
 	};
 
 	/*
@@ -784,19 +954,26 @@ private:
 
 } // namespace client
 
-int main() {
-    if (auto result = net::NetworkManager::instance().init(); !result) {
-        return 1;
-    }
+auto main( ) -> int
+{
+	if ( auto result{ net::network_manager_t::instance( ).init( ) }; !result )
+	{
+		return 1;
+	}
 
-    client::game_client_t client{ };
+	client::game_client_t client{ };
 
-    if ( auto result{ client.connect( ) }; !result )
-    {
-        return 1;
-    }
+	/*
+	   set up protected function system
+	*/
+	client::protected_function_caller_t::set_requester( &client );
 
-    client.run();
+	if ( auto result{ client.connect( ) }; !result )
+	{
+		return 1;
+	}
+
+	client.run( );
 
     return 0;
 }
