@@ -2,52 +2,77 @@
 #include "crypto.hpp"
 #include <cstring>
 
-namespace proto {
+namespace proto
+{
+	/**
+	 * @brief serialize packet to buffer
+	 * @param buffer destination buffer
+	 * @return number of bytes written, 0 on failure
+	 */
+	auto packet_t::serialize( std::span<uint8_t> buffer ) const noexcept -> uint16_t
+	{
+		if ( buffer.size( ) < sizeof( packet_header_t ) + header.length )
+		{
+			return 0;
+		}
 
-uint16_t Packet::serialize(std::span<uint8_t> buffer) const noexcept {
-    if (buffer.size() < sizeof(PacketHeader) + header.length) {
-        return 0;
-    }
+		/*
+		   copy header
+		*/
+		std::memcpy( buffer.data( ), &header, sizeof( packet_header_t ) );
 
-    // Copy header
-    std::memcpy(buffer.data(), &header, sizeof(PacketHeader));
+		/*
+		   copy payload
+		*/
+		if ( header.length > 0 )
+		{
+			std::memcpy( buffer.data( ) + sizeof( packet_header_t ), payload.data( ), header.length );
+		}
 
-    // Copy payload
-    if (header.length > 0) {
-        std::memcpy(buffer.data() + sizeof(PacketHeader), payload.data(), header.length);
-    }
+		return sizeof( packet_header_t ) + header.length;
+	}
 
-    return sizeof(PacketHeader) + header.length;
-}
+	/**
+	 * @brief deserialize packet from buffer
+	 * @param buffer source buffer
+	 * @return packet or error message
+	 */
+	auto packet_t::deserialize( std::span<const uint8_t> buffer ) noexcept
+		-> std::expected<packet_t, std::string_view>
+	{
+		if ( buffer.size( ) < sizeof( packet_header_t ) )
+		{
+			return std::unexpected( "Buffer too small for header" );
+		}
 
-std::expected<Packet, std::string_view>
-Packet::deserialize(std::span<const uint8_t> buffer) noexcept {
-    if (buffer.size() < sizeof(PacketHeader)) {
-        return std::unexpected("Buffer too small for header");
-    }
+		packet_t packet{ };
+		std::memcpy( &packet.header, buffer.data( ), sizeof( packet_header_t ) );
 
-    Packet packet;
-    std::memcpy(&packet.header, buffer.data(), sizeof(PacketHeader));
+		if ( !packet.header.valid( ) )
+		{
+			return std::unexpected( "Invalid packet magic or version" );
+		}
 
-    if (!packet.header.valid()) {
-        return std::unexpected("Invalid packet magic or version");
-    }
+		if ( packet.header.length > MAX_PAYLOAD_SIZE )
+		{
+			return std::unexpected( "Payload too large" );
+		}
 
-    if (packet.header.length > MAX_PAYLOAD_SIZE) {
-        return std::unexpected("Payload too large");
-    }
+		if ( buffer.size( ) < sizeof( packet_header_t ) + packet.header.length )
+		{
+			return std::unexpected( "Buffer too small for payload" );
+		}
 
-    if (buffer.size() < sizeof(PacketHeader) + packet.header.length) {
-        return std::unexpected("Buffer too small for payload");
-    }
+		/*
+		   copy payload
+		*/
+		if ( packet.header.length > 0 )
+		{
+			std::memcpy( packet.payload.data( ), buffer.data( ) + sizeof( packet_header_t ),
+			           packet.header.length );
+		}
 
-    // Copy payload
-    if (packet.header.length > 0) {
-        std::memcpy(packet.payload.data(), buffer.data() + sizeof(PacketHeader),
-                   packet.header.length);
-    }
-
-    return packet;
-}
+		return packet;
+	}
 
 } // namespace proto

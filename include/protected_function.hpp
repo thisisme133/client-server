@@ -19,400 +19,630 @@
 #include <unistd.h>
 #endif
 
-namespace protect {
+namespace protect
+{
+	/**
+	 * @brief compile-time hash for function markers (FNV-1a)
+	 * @param str string to hash
+	 * @return hash value
+	 */
+	constexpr auto fnv1a_hash( std::string_view str ) noexcept -> uint32_t
+	{
+		uint32_t hash{ 2166136261u };
+		for ( char c : str )
+		{
+			hash ^= static_cast<uint32_t>( c );
+			hash *= 16777619u;
+		}
+		return hash;
+	}
 
-// Compile-time hash for function markers
-constexpr uint32_t fnv1a_hash(std::string_view str) noexcept {
-    uint32_t hash = 2166136261u;
-    for (char c : str) {
-        hash ^= static_cast<uint32_t>(c);
-        hash *= 16777619u;
-    }
-    return hash;
-}
+	/**
+	 * @brief marker type - identifies a protected function
+	 */
+	struct function_marker_t
+	{
+		uint32_t hash{ };
+		std::string_view name{ };
 
-// Marker type - identifies a protected function
-struct FunctionMarker {
-    uint32_t hash;
-    std::string_view name;
+		/**
+		 * @brief construct marker from name
+		 * @param n function name
+		 */
+		constexpr function_marker_t( std::string_view n ) noexcept
+			: hash{ fnv1a_hash( n ) }, name{ n }
+		{
+		}
 
-    constexpr FunctionMarker(std::string_view n) noexcept
-        : hash(fnv1a_hash(n)), name(n) {}
+		/**
+		 * @brief equality operator (checks both hash AND name to prevent collision attacks)
+		 * @param other other marker
+		 * @return true if markers are equal
+		 */
+		constexpr auto operator==( const function_marker_t& other ) const noexcept -> bool
+		{
+			return hash == other.hash && name == other.name;
+		}
+	};
 
-    // Compare both hash AND name to prevent collision attacks
-    constexpr bool operator==(const FunctionMarker& other) const noexcept {
-        return hash == other.hash && name == other.name;
-    }
-};
+	/*
+	   macros for protected function definition
+	*/
+	#define MARKER( name ) ::protect::function_marker_t{ #name }
 
-// Macro to create a marker
-#define MARKER(name) ::protect::FunctionMarker{#name}
+	#ifdef PROTECTED_FUNCTION_SERVER
+		#define MARKER_DEF( RetType, Name ) \
+			static auto Name
+	#else
+		#define MARKER_DEF( RetType, Name ) \
+			static auto Name [[maybe_unused]]
+	#endif
 
-// Macro to define a protected function (stub on client, real on server)
-#ifdef PROTECTED_FUNCTION_SERVER
-    // Server side: real implementation
-    #define MARKER_DEF(RetType, Name) \
-        static RetType Name
-#else
-    // Client side: stub that will request from server
-    #define MARKER_DEF(RetType, Name) \
-        static RetType Name [[maybe_unused]]
-#endif
+	/**
+	 * @brief temporary function executor
+	 *
+	 * Allocates executable memory, executes code, then immediately frees it.
+	 * Supports W^X systems (SELinux, hardened Linux) by using RW -> RX transition.
+	 * This prevents the function from staying in memory for analysis.
+	 */
+	class temporary_function_t
+	{
+		void* m_exec_memory{ nullptr };
+		size_t m_size{ 0 };
+		bool m_using_wx_separate{ false };
 
-// Temporary function executor - allocates executable memory, executes, then immediately frees
-// Supports W^X systems (SELinux, hardened Linux) by using RW -> RX transition
-// This prevents the function from staying in memory for analysis
-class TemporaryFunction {
-    void* exec_memory_ = nullptr;
-    size_t size_ = 0;
-    bool using_wx_separate_ = false;
-
-public:
-    explicit TemporaryFunction(std::span<const uint8_t> bytecode) : size_(bytecode.size()) {
-        if (bytecode.empty()) return;
+	public:
+		/**
+		 * @brief construct temporary function from bytecode
+		 * @param bytecode function bytecode
+		 */
+		explicit temporary_function_t( std::span<const uint8_t> bytecode ) : m_size{ bytecode.size( ) }
+		{
+			if ( bytecode.empty( ) ) return;
 
 #ifdef _WIN32
-        // Try RWX first (most common)
-        exec_memory_ = VirtualAlloc(nullptr, size_,
-                                    MEM_COMMIT | MEM_RESERVE,
-                                    PAGE_EXECUTE_READWRITE);
+			/*
+			   try RWX first (most common)
+			*/
+			m_exec_memory = VirtualAlloc( nullptr, m_size,
+			                              MEM_COMMIT | MEM_RESERVE,
+			                              PAGE_EXECUTE_READWRITE );
 
-        if (!exec_memory_) {
-            // If RWX fails (rare on Windows), try RW -> RX
-            exec_memory_ = VirtualAlloc(nullptr, size_,
-                                        MEM_COMMIT | MEM_RESERVE,
-                                        PAGE_READWRITE);
-            using_wx_separate_ = true;
-        }
+			if ( !m_exec_memory )
+			{
+				/*
+				   if RWX fails (rare on Windows), try RW -> RX
+				*/
+				m_exec_memory = VirtualAlloc( nullptr, m_size,
+				                              MEM_COMMIT | MEM_RESERVE,
+				                              PAGE_READWRITE );
+				m_using_wx_separate = true;
+			}
 
-        if (exec_memory_) {
-            std::memcpy(exec_memory_, bytecode.data(), size_);
+			if ( m_exec_memory )
+			{
+				std::memcpy( m_exec_memory, bytecode.data( ), m_size );
 
-            // If using W^X, change to RX now
-            if (using_wx_separate_) {
-                DWORD old_protect;
-                VirtualProtect(exec_memory_, size_, PAGE_EXECUTE_READ, &old_protect);
-            }
-        }
+				/*
+				   if using W^X, change to RX now
+				*/
+				if ( m_using_wx_separate )
+				{
+					DWORD old_protect{ };
+					VirtualProtect( m_exec_memory, m_size, PAGE_EXECUTE_READ, &old_protect );
+				}
+			}
 #else
-        // Try RWX first
-        exec_memory_ = mmap(nullptr, size_,
-                           PROT_READ | PROT_WRITE | PROT_EXEC,
-                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			/*
+			   try RWX first
+			*/
+			m_exec_memory = mmap( nullptr, m_size,
+			                      PROT_READ | PROT_WRITE | PROT_EXEC,
+			                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0 );
 
-        if (exec_memory_ == MAP_FAILED) {
-            // W^X enforcement - try RW -> RX
-            exec_memory_ = mmap(nullptr, size_,
-                               PROT_READ | PROT_WRITE,
-                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            using_wx_separate_ = true;
-        }
+			if ( m_exec_memory == MAP_FAILED )
+			{
+				/*
+				   W^X enforcement - try RW -> RX
+				*/
+				m_exec_memory = mmap( nullptr, m_size,
+				                      PROT_READ | PROT_WRITE,
+				                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0 );
+				m_using_wx_separate = true;
+			}
 
-        if (exec_memory_ != MAP_FAILED) {
-            std::memcpy(exec_memory_, bytecode.data(), size_);
+			if ( m_exec_memory != MAP_FAILED )
+			{
+				std::memcpy( m_exec_memory, bytecode.data( ), m_size );
 
-            // Flush instruction cache and change to RX
-            if (using_wx_separate_) {
-                __builtin___clear_cache(
-                    reinterpret_cast<char*>(exec_memory_),
-                    reinterpret_cast<char*>(exec_memory_) + size_
-                );
-                mprotect(exec_memory_, size_, PROT_READ | PROT_EXEC);
-            }
-        } else {
-            exec_memory_ = nullptr;
-        }
+				/*
+				   flush instruction cache and change to RX
+				*/
+				if ( m_using_wx_separate )
+				{
+					__builtin___clear_cache(
+						reinterpret_cast<char*>( m_exec_memory ),
+						reinterpret_cast<char*>( m_exec_memory ) + m_size
+					);
+					mprotect( m_exec_memory, m_size, PROT_READ | PROT_EXEC );
+				}
+			}
+			else
+			{
+				m_exec_memory = nullptr;
+			}
 #endif
-    }
+		}
 
-    ~TemporaryFunction() {
-        // Immediately free executable memory after use
-        if (exec_memory_) {
+		/**
+		 * @brief destructor - immediately frees executable memory
+		 */
+		~temporary_function_t( )
+		{
+			if ( m_exec_memory )
+			{
 #ifdef _WIN32
-            VirtualFree(exec_memory_, 0, MEM_RELEASE);
+				VirtualFree( m_exec_memory, 0, MEM_RELEASE );
 #else
-            munmap(exec_memory_, size_);
+				munmap( m_exec_memory, m_size );
 #endif
-            exec_memory_ = nullptr;
-        }
-    }
+				m_exec_memory = nullptr;
+			}
+		}
 
-    TemporaryFunction(const TemporaryFunction&) = delete;
-    TemporaryFunction& operator=(const TemporaryFunction&) = delete;
-    TemporaryFunction(TemporaryFunction&&) = delete;
+		temporary_function_t( const temporary_function_t& ) = delete;
+		auto operator=( const temporary_function_t& ) -> temporary_function_t& = delete;
+		temporary_function_t( temporary_function_t&& ) = delete;
 
-    template<typename Ret, typename... Args>
-    Ret execute(Args&&... args) const {
-        if (!exec_memory_) {
-            if constexpr (std::is_same_v<Ret, bool>) {
-                return false;
-            } else if constexpr (std::is_arithmetic_v<Ret>) {
-                return static_cast<Ret>(0);
-            } else {
-                return Ret{};
-            }
-        }
+		/**
+		 * @brief execute function with arguments
+		 * @tparam Ret return type
+		 * @tparam Args argument types
+		 * @param args function arguments
+		 * @return function result
+		 */
+		template<typename Ret, typename... Args>
+		auto execute( Args&&... args ) const -> Ret
+		{
+			if ( !m_exec_memory )
+			{
+				if constexpr ( std::is_same_v<Ret, bool> )
+				{
+					return false;
+				}
+				else if constexpr ( std::is_arithmetic_v<Ret> )
+				{
+					return static_cast<Ret>( 0 );
+				}
+				else
+				{
+					return Ret{ };
+				}
+			}
 
-        using FnPtr = Ret(*)(Args...);
-        auto fn = reinterpret_cast<FnPtr>(exec_memory_);
-        return fn(std::forward<Args>(args)...);
-    }
+			using fn_ptr = Ret( * )( Args... );
+			auto fn{ reinterpret_cast<fn_ptr>( m_exec_memory ) };
+			return fn( std::forward<Args>( args )... );
+		}
 
-    [[nodiscard]] bool valid() const noexcept {
-        return exec_memory_ != nullptr;
-    }
-};
+		/**
+		 * @brief check if function is valid
+		 * @return true if executable memory allocated successfully
+		 */
+		[[nodiscard]] auto valid( ) const noexcept -> bool
+		{
+			return m_exec_memory != nullptr;
+		}
+	};
 
-// Simple SHA256 implementation for bytecode integrity verification
-inline constexpr uint32_t simple_checksum(std::span<const uint8_t> data) noexcept {
-    uint32_t checksum = 0x5A5A5A5A;
-    for (size_t i = 0; i < data.size(); ++i) {
-        checksum ^= data[i];
-        checksum = (checksum << 7) | (checksum >> 25);
-        checksum += i * 0x01000193;
-    }
-    return checksum;
-}
+	/**
+	 * @brief simple checksum for bytecode integrity verification
+	 * @param data bytecode data
+	 * @return checksum value
+	 */
+	inline constexpr auto simple_checksum( std::span<const uint8_t> data ) noexcept -> uint32_t
+	{
+		uint32_t checksum{ 0x5A5A5A5A };
+		for ( size_t i{ 0 }; i < data.size( ); ++i )
+		{
+			checksum ^= data[i];
+			checksum = ( checksum << 7 ) | ( checksum >> 25 );
+			checksum += i * 0x01000193;
+		}
+		return checksum;
+	}
 
-// Bytecode storage - stores raw bytes with integrity verification
-// RWX memory is allocated only during execution and freed immediately after
-class BytecodeStorage {
-    struct BytecodeEntry {
-        std::string name;
-        std::vector<uint8_t> code;
-        uint32_t checksum;
-        size_t expected_size;
-    };
+	/**
+	 * @brief bytecode storage with integrity verification
+	 *
+	 * Stores raw bytes with integrity verification.
+	 * RWX memory is allocated only during execution and freed immediately after.
+	 */
+	class bytecode_storage_t
+	{
+		/**
+		 * @brief bytecode entry structure
+		 */
+		struct bytecode_entry_t
+		{
+			std::string name{ };
+			std::vector<uint8_t> code{ };
+			uint32_t checksum{ };
+			size_t expected_size{ };
+		};
 
-    std::unordered_map<uint32_t, BytecodeEntry> storage_;
-    std::mutex mutex_;
+		std::unordered_map<uint32_t, bytecode_entry_t> m_storage{ };
+		std::mutex m_mutex{ };
 
-    BytecodeStorage() = default;
+		/**
+		 * @brief private constructor (singleton)
+		 */
+		bytecode_storage_t( ) = default;
 
-public:
-    static BytecodeStorage& instance() {
-        static BytecodeStorage storage;
-        return storage;
-    }
+	public:
+		/**
+		 * @brief get singleton instance
+		 * @return reference to storage
+		 */
+		static auto instance( ) -> bytecode_storage_t&
+		{
+			static bytecode_storage_t storage{ };
+			return storage;
+		}
 
-    // Store bytecode with name verification and integrity check
-    bool store(uint32_t marker_hash, std::string_view name, std::span<const uint8_t> code) {
-        std::lock_guard lock(mutex_);
+		/**
+		 * @brief store bytecode with name verification and integrity check
+		 * @param marker_hash function marker hash
+		 * @param name function name
+		 * @param code function bytecode
+		 * @return true if stored successfully
+		 */
+		auto store( uint32_t marker_hash, std::string_view name, std::span<const uint8_t> code ) -> bool
+		{
+			std::lock_guard lock{ m_mutex };
 
-        // Detect hash collision - different name with same hash
-        auto it = storage_.find(marker_hash);
-        if (it != storage_.end() && it->second.name != name) {
-            // CRITICAL: Hash collision detected!
-            return false;
-        }
+			/*
+			   detect hash collision - different name with same hash
+			*/
+			auto it{ m_storage.find( marker_hash ) };
+			if ( it != m_storage.end( ) && it->second.name != name )
+			{
+				// CRITICAL: Hash collision detected!
+				return false;
+			}
 
-        BytecodeEntry entry;
-        entry.name = std::string(name);
-        entry.code = std::vector<uint8_t>(code.begin(), code.end());
-        entry.checksum = simple_checksum(code);
-        entry.expected_size = code.size();
+			bytecode_entry_t entry{ };
+			entry.name = std::string( name );
+			entry.code = std::vector<uint8_t>( code.begin( ), code.end( ) );
+			entry.checksum = simple_checksum( code );
+			entry.expected_size = code.size( );
 
-        storage_[marker_hash] = std::move(entry);
-        return true;
-    }
+			m_storage[marker_hash] = std::move( entry );
+			return true;
+		}
 
-    // Get bytecode with integrity verification
-    std::vector<uint8_t> get(uint32_t marker_hash, std::string_view expected_name) {
-        std::lock_guard lock(mutex_);
-        auto it = storage_.find(marker_hash);
+		/**
+		 * @brief get bytecode with integrity verification
+		 * @param marker_hash function marker hash
+		 * @param expected_name expected function name
+		 * @return bytecode or empty vector on error
+		 */
+		auto get( uint32_t marker_hash, std::string_view expected_name ) -> std::vector<uint8_t>
+		{
+			std::lock_guard lock{ m_mutex };
+			auto it{ m_storage.find( marker_hash ) };
 
-        if (it == storage_.end()) {
-            return {};
-        }
+			if ( it == m_storage.end( ) )
+			{
+				return { };
+			}
 
-        auto& entry = it->second;
+			auto& entry{ it->second };
 
-        // Verify name matches (collision detection)
-        if (entry.name != expected_name) {
-            return {};
-        }
+			/*
+			   verify name matches (collision detection)
+			*/
+			if ( entry.name != expected_name )
+			{
+				return { };
+			}
 
-        // Verify integrity
-        uint32_t actual_checksum = simple_checksum(entry.code);
-        if (actual_checksum != entry.checksum) {
-            // Bytecode corrupted!
-            storage_.erase(it);
-            return {};
-        }
+			/*
+			   verify integrity
+			*/
+			uint32_t actual_checksum{ simple_checksum( entry.code ) };
+			if ( actual_checksum != entry.checksum )
+			{
+				// Bytecode corrupted!
+				m_storage.erase( it );
+				return { };
+			}
 
-        // Verify size
-        if (entry.code.size() != entry.expected_size) {
-            // Size mismatch!
-            storage_.erase(it);
-            return {};
-        }
+			/*
+			   verify size
+			*/
+			if ( entry.code.size( ) != entry.expected_size )
+			{
+				// Size mismatch!
+				m_storage.erase( it );
+				return { };
+			}
 
-        return entry.code;
-    }
+			return entry.code;
+		}
 
-    bool has(uint32_t marker_hash, std::string_view expected_name) {
-        std::lock_guard lock(mutex_);
-        auto it = storage_.find(marker_hash);
-        return it != storage_.end() && it->second.name == expected_name;
-    }
+		/**
+		 * @brief check if function exists in storage
+		 * @param marker_hash function marker hash
+		 * @param expected_name expected function name
+		 * @return true if function exists and name matches
+		 */
+		auto has( uint32_t marker_hash, std::string_view expected_name ) -> bool
+		{
+			std::lock_guard lock{ m_mutex };
+			auto it{ m_storage.find( marker_hash ) };
+			return it != m_storage.end( ) && it->second.name == expected_name;
+		}
 
-    void clear() {
-        std::lock_guard lock(mutex_);
-        storage_.clear();
-    }
-};
+		/**
+		 * @brief clear all stored functions
+		 */
+		auto clear( ) -> void
+		{
+			std::lock_guard lock{ m_mutex };
+			m_storage.clear( );
+		}
+	};
 
-// Pending function requests
-class PendingRequests {
-    struct Request {
-        uint32_t marker_hash;
-        std::mutex mutex;
-        std::condition_variable cv;
-        bool completed = false;
-    };
+	/**
+	 * @brief pending function requests manager
+	 */
+	class pending_requests_t
+	{
+		/**
+		 * @brief request structure
+		 */
+		struct request_t
+		{
+			uint32_t marker_hash{ };
+			std::mutex mutex{ };
+			std::condition_variable cv{ };
+			bool completed{ false };
+		};
 
-    std::unordered_map<uint32_t, std::shared_ptr<Request>> requests_;
-    std::mutex mutex_;
+		std::unordered_map<uint32_t, std::shared_ptr<request_t>> m_requests{ };
+		std::mutex m_mutex{ };
 
-    PendingRequests() = default;
+		/**
+		 * @brief private constructor (singleton)
+		 */
+		pending_requests_t( ) = default;
 
-public:
-    static PendingRequests& instance() {
-        static PendingRequests pending;
-        return pending;
-    }
+	public:
+		/**
+		 * @brief get singleton instance
+		 * @return reference to pending requests
+		 */
+		static auto instance( ) -> pending_requests_t&
+		{
+			static pending_requests_t pending{ };
+			return pending;
+		}
 
-    std::shared_ptr<Request> add(uint32_t marker_hash) {
-        std::lock_guard lock(mutex_);
-        auto req = std::make_shared<Request>();
-        req->marker_hash = marker_hash;
-        requests_[marker_hash] = req;
-        return req;
-    }
+		/**
+		 * @brief add pending request
+		 * @param marker_hash function marker hash
+		 * @return shared pointer to request
+		 */
+		auto add( uint32_t marker_hash ) -> std::shared_ptr<request_t>
+		{
+			std::lock_guard lock{ m_mutex };
+			auto req{ std::make_shared<request_t>( ) };
+			req->marker_hash = marker_hash;
+			m_requests[marker_hash] = req;
+			return req;
+		}
 
-    void complete(uint32_t marker_hash) {
-        std::shared_ptr<Request> req;
-        {
-            std::lock_guard lock(mutex_);
-            auto it = requests_.find(marker_hash);
-            if (it != requests_.end()) {
-                req = it->second;
-                requests_.erase(it);
-            }
-        }
+		/**
+		 * @brief complete pending request
+		 * @param marker_hash function marker hash
+		 */
+		auto complete( uint32_t marker_hash ) -> void
+		{
+			std::shared_ptr<request_t> req{ };
+			{
+				std::lock_guard lock{ m_mutex };
+				auto it{ m_requests.find( marker_hash ) };
+				if ( it != m_requests.end( ) )
+				{
+					req = it->second;
+					m_requests.erase( it );
+				}
+			}
 
-        if (req) {
-            std::lock_guard lock(req->mutex);
-            req->completed = true;
-            req->cv.notify_all();
-        }
-    }
+			if ( req )
+			{
+				std::lock_guard lock{ req->mutex };
+				req->completed = true;
+				req->cv.notify_all( );
+			}
+		}
 
-    // Remove a pending request (e.g., on immediate send failure)
-    void remove(uint32_t marker_hash) {
-        std::lock_guard lock(mutex_);
-        requests_.erase(marker_hash);
-    }
+		/**
+		 * @brief remove pending request (e.g., on immediate send failure)
+		 * @param marker_hash function marker hash
+		 */
+		auto remove( uint32_t marker_hash ) -> void
+		{
+			std::lock_guard lock{ m_mutex };
+			m_requests.erase( marker_hash );
+		}
 
-    bool wait_for(uint32_t marker_hash, std::chrono::milliseconds timeout) {
-        std::shared_ptr<Request> req;
-        {
-            std::lock_guard lock(mutex_);
-            auto it = requests_.find(marker_hash);
-            if (it != requests_.end()) {
-                req = it->second;
-            }
-        }
+		/**
+		 * @brief wait for request completion
+		 * @param marker_hash function marker hash
+		 * @param timeout timeout duration
+		 * @return true if completed within timeout
+		 */
+		auto wait_for( uint32_t marker_hash, std::chrono::milliseconds timeout ) -> bool
+		{
+			std::shared_ptr<request_t> req{ };
+			{
+				std::lock_guard lock{ m_mutex };
+				auto it{ m_requests.find( marker_hash ) };
+				if ( it != m_requests.end( ) )
+				{
+					req = it->second;
+				}
+			}
 
-        if (!req) return false;
+			if ( !req ) return false;
 
-        std::unique_lock lock(req->mutex);
-        bool success = req->cv.wait_for(lock, timeout, [&] { return req->completed; });
+			std::unique_lock lock{ req->mutex };
+			bool success{ req->cv.wait_for( lock, timeout, [&] { return req->completed; } ) };
 
-        // CRITICAL: Clean up request from map regardless of success/failure
-        // This prevents memory leaks and allows retries
-        {
-            std::lock_guard map_lock(mutex_);
-            auto it = requests_.find(marker_hash);
-            if (it != requests_.end() && !it->second->completed) {
-                // Only remove if not completed (complete() already removed it)
-                requests_.erase(it);
-            }
-        }
+			/*
+			   CRITICAL: Clean up request from map regardless of success/failure
+			   This prevents memory leaks and allows retries
+			*/
+			{
+				std::lock_guard map_lock{ m_mutex };
+				auto it{ m_requests.find( marker_hash ) };
+				if ( it != m_requests.end( ) && !it->second->completed )
+				{
+					// Only remove if not completed (complete() already removed it)
+					m_requests.erase( it );
+				}
+			}
 
-        return success;
-    }
-};
+			return success;
+		}
+	};
 
-// Forward declaration for client communication
-class FunctionRequester;
+	/*
+	   forward declaration
+	*/
+	class function_requester_t;
 
-// Global protected function caller
-class FnProtectGlobal {
-    static inline FunctionRequester* requester_ = nullptr;
+	/**
+	 * @brief global protected function caller
+	 */
+	class fn_protect_global_t
+	{
+		static inline function_requester_t* m_requester{ nullptr };
 
-public:
-    static void set_requester(FunctionRequester* req) {
-        requester_ = req;
-    }
+	public:
+		/**
+		 * @brief set function requester
+		 * @param req requester instance
+		 */
+		static auto set_requester( function_requester_t* req ) -> void
+		{
+			m_requester = req;
+		}
 
-    template<typename Ret, typename... Args>
-    static std::expected<Ret, std::string_view> Call(
-        FunctionMarker marker, Args&&... args
-    ) {
-        auto& storage = BytecodeStorage::instance();
+		/**
+		 * @brief call protected function
+		 * @tparam Ret return type
+		 * @tparam Args argument types
+		 * @param marker function marker
+		 * @param args function arguments
+		 * @return function result or error message
+		 */
+		template<typename Ret, typename... Args>
+		static auto call( function_marker_t marker, Args&&... args ) -> std::expected<Ret, std::string_view>
+		{
+			auto& storage{ bytecode_storage_t::instance( ) };
 
-        // Check if bytecode is in storage (with name verification)
-        std::vector<uint8_t> bytecode = storage.get(marker.hash, marker.name);
+			/*
+			   check if bytecode is in storage (with name verification)
+			*/
+			std::vector<uint8_t> bytecode{ storage.get( marker.hash, marker.name ) };
 
-        // If not in storage, request from server
-        if (bytecode.empty()) {
-            if (!requester_) {
-                return std::unexpected("No function requester set");
-            }
+			/*
+			   if not in storage, request from server
+			*/
+			if ( bytecode.empty( ) )
+			{
+				if ( !m_requester )
+				{
+					return std::unexpected( "No function requester set" );
+				}
 
-            // Request function and wait for response
-            if (!request_and_wait(marker.hash)) {
-                return std::unexpected("Failed to receive function from server");
-            }
+				/*
+				   request function and wait for response
+				*/
+				if ( !request_and_wait( marker.hash ) )
+				{
+					return std::unexpected( "Failed to receive function from server" );
+				}
 
-            // Get bytecode from storage with verification
-            bytecode = storage.get(marker.hash, marker.name);
-            if (bytecode.empty()) {
-                return std::unexpected("Function bytecode not available or integrity check failed");
-            }
-        }
+				/*
+				   get bytecode from storage with verification
+				*/
+				bytecode = storage.get( marker.hash, marker.name );
+				if ( bytecode.empty( ) )
+				{
+					return std::unexpected( "Function bytecode not available or integrity check failed" );
+				}
+			}
 
-        // Additional size sanity check
-        if (bytecode.size() > 1024 * 1024) {  // 1MB max
-            return std::unexpected("Function bytecode too large - possible corruption");
-        }
+			/*
+			   additional size sanity check
+			*/
+			if ( bytecode.size( ) > 1024 * 1024 )  // 1MB max
+			{
+				return std::unexpected( "Function bytecode too large - possible corruption" );
+			}
 
-        if (bytecode.size() < 4) {  // Minimum viable function size
-            return std::unexpected("Function bytecode too small - possible corruption");
-        }
+			if ( bytecode.size( ) < 4 )  // Minimum viable function size
+			{
+				return std::unexpected( "Function bytecode too small - possible corruption" );
+			}
 
-        // Allocate executable memory temporarily (RAII - freed on scope exit)
-        // Supports both RWX and W^X systems
-        TemporaryFunction temp_fn(bytecode);
+			/*
+			   allocate executable memory temporarily (RAII - freed on scope exit)
+			   Supports both RWX and W^X systems
+			*/
+			temporary_function_t temp_fn{ bytecode };
 
-        if (!temp_fn.valid()) {
-            return std::unexpected("Failed to allocate executable memory (W^X or SELinux may be blocking)");
-        }
+			if ( !temp_fn.valid( ) )
+			{
+				return std::unexpected( "Failed to allocate executable memory (W^X or SELinux may be blocking)" );
+			}
 
-        // Execute function - memory will be freed automatically when temp_fn goes out of scope
-        return temp_fn.execute<Ret>(std::forward<Args>(args)...);
-    }
+			/*
+			   execute function - memory will be freed automatically when temp_fn goes out of scope
+			*/
+			return temp_fn.execute<Ret>( std::forward<Args>( args )... );
+		}
 
-private:
-    static bool request_and_wait(uint32_t marker_hash);
-};
+	private:
+		/**
+		 * @brief request function and wait for response
+		 * @param marker_hash function marker hash
+		 * @return true if request succeeded
+		 */
+		static auto request_and_wait( uint32_t marker_hash ) -> bool;
+	};
 
-// Function requester interface (implemented by client)
-class FunctionRequester {
-public:
-    virtual ~FunctionRequester() = default;
-    virtual bool request_function(uint32_t marker_hash) = 0;
-};
+	/**
+	 * @brief function requester interface (implemented by client)
+	 */
+	class function_requester_t
+	{
+	public:
+		/**
+		 * @brief virtual destructor
+		 */
+		virtual ~function_requester_t( ) = default;
+
+		/**
+		 * @brief request function from server
+		 * @param marker_hash function marker hash
+		 * @return true if request sent successfully
+		 */
+		virtual auto request_function( uint32_t marker_hash ) -> bool = 0;
+	};
 
 } // namespace protect

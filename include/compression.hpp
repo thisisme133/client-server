@@ -5,85 +5,128 @@
 #include <expected>
 #include <string_view>
 
-namespace compression {
+namespace compression
+{
+	/**
+	 * @brief simple RLE compression (fast, low overhead)
+	 */
+	class rle_t
+	{
+	public:
+		/**
+		 * @brief compress data using run-length encoding
+		 * @param input input data
+		 * @param output output buffer
+		 * @return compressed size or error message
+		 */
+		[[nodiscard]] static auto compress( std::span<const uint8_t> input, std::span<uint8_t> output ) noexcept
+			-> std::expected<size_t, std::string_view>
+		{
+			if ( output.size( ) < input.size( ) * 2 )
+			{
+				return std::unexpected( "Output buffer too small" );
+			}
 
-// Simple RLE compression (fast, low overhead)
-class RLE {
-public:
-    [[nodiscard]] static std::expected<size_t, std::string_view>
-    compress(std::span<const uint8_t> input, std::span<uint8_t> output) noexcept {
-        if (output.size() < input.size() * 2) {
-            return std::unexpected("Output buffer too small");
-        }
+			size_t out_idx{ 0 };
+			size_t in_idx{ 0 };
 
-        size_t out_idx = 0;
-        size_t in_idx = 0;
+			while ( in_idx < input.size( ) )
+			{
+				uint8_t current{ input[in_idx] };
+				uint8_t count{ 1 };
 
-        while (in_idx < input.size()) {
-            uint8_t current = input[in_idx];
-            uint8_t count = 1;
+				/*
+				   count consecutive identical bytes (max 255)
+				*/
+				while ( in_idx + count < input.size( ) &&
+				        input[in_idx + count] == current &&
+				        count < 255 )
+				{
+					++count;
+				}
 
-            // Count consecutive identical bytes (max 255)
-            while (in_idx + count < input.size() &&
-                   input[in_idx + count] == current &&
-                   count < 255) {
-                ++count;
-            }
+				/*
+				   write count + byte
+				*/
+				if ( out_idx + 2 > output.size( ) )
+				{
+					return std::unexpected( "Output overflow" );
+				}
 
-            // Write count + byte
-            if (out_idx + 2 > output.size()) {
-                return std::unexpected("Output overflow");
-            }
+				output[out_idx++] = count;
+				output[out_idx++] = current;
+				in_idx += count;
+			}
 
-            output[out_idx++] = count;
-            output[out_idx++] = current;
-            in_idx += count;
-        }
+			return out_idx;
+		}
 
-        return out_idx;
-    }
+		/**
+		 * @brief decompress RLE-encoded data
+		 * @param input compressed data
+		 * @param output output buffer
+		 * @return decompressed size or error message
+		 */
+		[[nodiscard]] static auto decompress( std::span<const uint8_t> input, std::span<uint8_t> output ) noexcept
+			-> std::expected<size_t, std::string_view>
+		{
+			if ( input.size( ) % 2 != 0 )
+			{
+				return std::unexpected( "Invalid compressed data" );
+			}
 
-    [[nodiscard]] static std::expected<size_t, std::string_view>
-    decompress(std::span<const uint8_t> input, std::span<uint8_t> output) noexcept {
-        if (input.size() % 2 != 0) {
-            return std::unexpected("Invalid compressed data");
-        }
+			size_t out_idx{ 0 };
 
-        size_t out_idx = 0;
+			for ( size_t in_idx{ 0 }; in_idx < input.size( ); in_idx += 2 )
+			{
+				uint8_t count{ input[in_idx] };
+				uint8_t value{ input[in_idx + 1] };
 
-        for (size_t in_idx = 0; in_idx < input.size(); in_idx += 2) {
-            uint8_t count = input[in_idx];
-            uint8_t value = input[in_idx + 1];
+				if ( out_idx + count > output.size( ) )
+				{
+					return std::unexpected( "Output overflow" );
+				}
 
-            if (out_idx + count > output.size()) {
-                return std::unexpected("Output overflow");
-            }
+				for ( uint8_t i{ 0 }; i < count; ++i )
+				{
+					output[out_idx++] = value;
+				}
+			}
 
-            for (uint8_t i = 0; i < count; ++i) {
-                output[out_idx++] = value;
-            }
-        }
+			return out_idx;
+		}
 
-        return out_idx;
-    }
+		/**
+		 * @brief check if data should be compressed
+		 * @param data data to check
+		 * @return true if compression is recommended
+		 */
+		[[nodiscard]] static constexpr auto should_compress( std::span<const uint8_t> data ) noexcept -> bool
+		{
+			/*
+			   only compress if data is large enough and has repetition potential
+			*/
+			if ( data.size( ) < 256 ) return false;
 
-    [[nodiscard]] static constexpr bool should_compress(std::span<const uint8_t> data) noexcept {
-        // Only compress if data is large enough and has repetition potential
-        if (data.size() < 256) return false;
+			/*
+			   quick heuristic: check if there's repetition in first 256 bytes
+			*/
+			size_t check_size{ std::min( data.size( ), size_t{ 256 } ) };
+			uint32_t repetition_count{ 0 };
 
-        // Quick heuristic: check if there's repetition in first 256 bytes
-        size_t check_size = std::min(data.size(), size_t{256});
-        uint32_t repetition_count = 0;
+			for ( size_t i{ 1 }; i < check_size; ++i )
+			{
+				if ( data[i] == data[i - 1] )
+				{
+					++repetition_count;
+				}
+			}
 
-        for (size_t i = 1; i < check_size; ++i) {
-            if (data[i] == data[i - 1]) {
-                ++repetition_count;
-            }
-        }
-
-        // If more than 25% repetition, worth compressing
-        return repetition_count > (check_size / 4);
-    }
-};
+			/*
+			   if more than 25% repetition, worth compressing
+			*/
+			return repetition_count > ( check_size / 4 );
+		}
+	};
 
 } // namespace compression

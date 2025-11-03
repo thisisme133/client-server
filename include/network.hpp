@@ -12,124 +12,281 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 using socket_t = SOCKET;
-constexpr socket_t INVALID_SOCKET_VALUE = INVALID_SOCKET;
+constexpr socket_t INVALID_SOCKET_VALUE{ INVALID_SOCKET };
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 using socket_t = int;
-constexpr socket_t INVALID_SOCKET_VALUE = -1;
+constexpr socket_t INVALID_SOCKET_VALUE{ -1 };
 #endif
 
-namespace net {
+namespace net
+{
+	/*
+	   concepts for type safety
+	*/
 
-// Concepts
-template<typename T>
-concept SocketType = std::same_as<T, socket_t>;
+	/**
+	 * @brief concept for socket types
+	 * @tparam T type to check
+	 */
+	template<typename T>
+	concept socket_type = std::same_as<T, socket_t>;
 
-template<typename T>
-concept AddressType = requires(T addr) {
-    { addr.sin_family } -> std::convertible_to<uint16_t>;
-    { addr.sin_port } -> std::convertible_to<uint16_t>;
-};
+	/**
+	 * @brief concept for address types
+	 * @tparam T type to check
+	 */
+	template<typename T>
+	concept address_type = requires( T addr )
+	{
+		{ addr.sin_family } -> std::convertible_to<uint16_t>;
+		{ addr.sin_port } -> std::convertible_to<uint16_t>;
+	};
 
-// Error handling
-enum class Error : int32_t {
-    None = 0,
-    InitFailed,
-    CreateFailed,
-    BindFailed,
-    ListenFailed,
-    ConnectFailed,
-    SendFailed,
-    RecvFailed,
-    InvalidSocket,
-    WouldBlock
-    // TODO: Add timeout errors, SSL errors, connection reset errors
-};
+	/*
+	   error enumeration
+	*/
 
-// RAII Socket wrapper
-class Socket {
-    socket_t fd_ = INVALID_SOCKET_VALUE;
+	/**
+	 * @brief network error codes
+	 */
+	enum class error_t : int32_t
+	{
+		none = 0,
+		init_failed,
+		create_failed,
+		bind_failed,
+		listen_failed,
+		connect_failed,
+		send_failed,
+		recv_failed,
+		invalid_socket,
+		would_block
+	};
 
-public:
-    constexpr Socket() noexcept = default;
-    explicit Socket(socket_t fd) noexcept : fd_(fd) {}
-    ~Socket() noexcept { close(); }
+	/**
+	 * @brief RAII socket wrapper
+	 */
+	class socket_wrapper_t
+	{
+		socket_t m_fd{ INVALID_SOCKET_VALUE };
 
-    Socket(const Socket&) = delete;
-    Socket& operator=(const Socket&) = delete;
+	public:
+		/**
+		 * @brief default constructor
+		 */
+		constexpr socket_wrapper_t( ) noexcept = default;
 
-    Socket(Socket&& other) noexcept : fd_(other.fd_) {
-        other.fd_ = INVALID_SOCKET_VALUE;
-    }
+		/**
+		 * @brief construct from socket descriptor
+		 * @param fd socket file descriptor
+		 */
+		explicit socket_wrapper_t( socket_t fd ) noexcept : m_fd{ fd }
+		{
+		}
 
-    Socket& operator=(Socket&& other) noexcept {
-        if (this != &other) {
-            close();
-            fd_ = other.fd_;
-            other.fd_ = INVALID_SOCKET_VALUE;
-        }
-        return *this;
-    }
+		/**
+		 * @brief destructor
+		 */
+		~socket_wrapper_t( ) noexcept
+		{
+			close( );
+		}
 
-    [[nodiscard]] constexpr socket_t get() const noexcept { return fd_; }
-    [[nodiscard]] constexpr bool valid() const noexcept { return fd_ != INVALID_SOCKET_VALUE; }
-    [[nodiscard]] constexpr explicit operator bool() const noexcept { return valid(); }
+		socket_wrapper_t( const socket_wrapper_t& ) = delete;
+		auto operator=( const socket_wrapper_t& ) -> socket_wrapper_t& = delete;
 
-    void close() noexcept;
-    [[nodiscard]] socket_t release() noexcept {
-        auto fd = fd_;
-        fd_ = INVALID_SOCKET_VALUE;
-        return fd;
-    }
+		/**
+		 * @brief move constructor
+		 * @param other socket to move from
+		 */
+		socket_wrapper_t( socket_wrapper_t&& other ) noexcept : m_fd{ other.m_fd }
+		{
+			other.m_fd = INVALID_SOCKET_VALUE;
+		}
 
-    // Operations
-    [[nodiscard]] std::expected<void, Error> set_nonblocking() noexcept;
-    [[nodiscard]] std::expected<size_t, Error> send(std::span<const uint8_t> data) noexcept;
-    [[nodiscard]] std::expected<size_t, Error> recv(std::span<uint8_t> buffer) noexcept;
+		/**
+		 * @brief move assignment operator
+		 * @param other socket to move from
+		 * @return reference to this socket
+		 */
+		auto operator=( socket_wrapper_t&& other ) noexcept -> socket_wrapper_t&
+		{
+			if ( this != &other )
+			{
+				close( );
+				m_fd = other.m_fd;
+				other.m_fd = INVALID_SOCKET_VALUE;
+			}
+			return *this;
+		}
 
-    // TODO: Add timeout support (setsockopt SO_RCVTIMEO/SO_SNDTIMEO)
-    // TODO: Add keep-alive configuration (SO_KEEPALIVE, TCP_KEEPIDLE, TCP_KEEPINTVL)
-    // TODO: Add buffer size configuration (SO_RCVBUF/SO_SNDBUF)
-    // TODO: Add SO_REUSEADDR/SO_REUSEPORT options for server sockets
-    // TODO: Add SSL/TLS wrapper class for encrypted connections
-};
+		/**
+		 * @brief get socket file descriptor
+		 * @return socket file descriptor
+		 */
+		[[nodiscard]] constexpr auto get( ) const noexcept -> socket_t
+		{
+			return m_fd;
+		}
 
-// Network Manager
-class NetworkManager {
-    bool initialized_ = false;
+		/**
+		 * @brief check if socket is valid
+		 * @return true if socket is valid
+		 */
+		[[nodiscard]] constexpr auto valid( ) const noexcept -> bool
+		{
+			return m_fd != INVALID_SOCKET_VALUE;
+		}
 
-    NetworkManager() = default;
-    ~NetworkManager();
+		/**
+		 * @brief boolean conversion operator
+		 * @return true if socket is valid
+		 */
+		[[nodiscard]] constexpr explicit operator bool( ) const noexcept
+		{
+			return valid( );
+		}
 
-public:
-    static NetworkManager& instance() {
-        static NetworkManager mgr;
-        return mgr;
-    }
+		/**
+		 * @brief close socket
+		 */
+		auto close( ) noexcept -> void;
 
-    NetworkManager(const NetworkManager&) = delete;
-    NetworkManager& operator=(const NetworkManager&) = delete;
+		/**
+		 * @brief release socket ownership
+		 * @return socket file descriptor
+		 */
+		[[nodiscard]] auto release( ) noexcept -> socket_t
+		{
+			auto fd{ m_fd };
+			m_fd = INVALID_SOCKET_VALUE;
+			return fd;
+		}
 
-    [[nodiscard]] std::expected<void, Error> init() noexcept;
-    void cleanup() noexcept;
-};
+		/**
+		 * @brief set socket to non-blocking mode
+		 * @return void or error
+		 */
+		[[nodiscard]] auto set_nonblocking( ) noexcept -> std::expected<void, error_t>;
 
-// Free functions
-[[nodiscard]] std::expected<Socket, Error> create_socket() noexcept;
-[[nodiscard]] std::expected<Socket, Error> connect(std::string_view ip, uint16_t port) noexcept;
-[[nodiscard]] std::expected<void, Error> bind(socket_t fd, uint16_t port) noexcept;
-[[nodiscard]] std::expected<void, Error> listen(socket_t fd, int backlog) noexcept;
-[[nodiscard]] std::expected<Socket, Error> accept(socket_t fd, std::array<char, 46>& ip, uint16_t& port) noexcept;
+		/**
+		 * @brief send data through socket
+		 * @param data data to send
+		 * @return number of bytes sent or error
+		 */
+		[[nodiscard]] auto send( std::span<const uint8_t> data ) noexcept -> std::expected<size_t, error_t>;
 
-[[nodiscard]] constexpr bool would_block() noexcept {
+		/**
+		 * @brief receive data from socket
+		 * @param buffer buffer to receive into
+		 * @return number of bytes received or error
+		 */
+		[[nodiscard]] auto recv( std::span<uint8_t> buffer ) noexcept -> std::expected<size_t, error_t>;
+	};
+
+	/**
+	 * @brief network manager (singleton)
+	 */
+	class network_manager_t
+	{
+		bool m_initialized{ false };
+
+		/**
+		 * @brief private constructor
+		 */
+		network_manager_t( ) = default;
+
+		/**
+		 * @brief destructor
+		 */
+		~network_manager_t( );
+
+	public:
+		/**
+		 * @brief get singleton instance
+		 * @return reference to network manager
+		 */
+		static auto instance( ) -> network_manager_t&
+		{
+			static network_manager_t mgr{ };
+			return mgr;
+		}
+
+		network_manager_t( const network_manager_t& ) = delete;
+		auto operator=( const network_manager_t& ) -> network_manager_t& = delete;
+
+		/**
+		 * @brief initialize network subsystem
+		 * @return void or error
+		 */
+		[[nodiscard]] auto init( ) noexcept -> std::expected<void, error_t>;
+
+		/**
+		 * @brief cleanup network subsystem
+		 */
+		auto cleanup( ) noexcept -> void;
+	};
+
+	/*
+	   free functions for network operations
+	*/
+
+	/**
+	 * @brief create a new socket
+	 * @return socket or error
+	 */
+	[[nodiscard]] auto create_socket( ) noexcept -> std::expected<socket_wrapper_t, error_t>;
+
+	/**
+	 * @brief connect to remote host
+	 * @param ip IP address
+	 * @param port port number
+	 * @return connected socket or error
+	 */
+	[[nodiscard]] auto connect( std::string_view ip, uint16_t port ) noexcept
+		-> std::expected<socket_wrapper_t, error_t>;
+
+	/**
+	 * @brief bind socket to port
+	 * @param fd socket file descriptor
+	 * @param port port number
+	 * @return void or error
+	 */
+	[[nodiscard]] auto bind( socket_t fd, uint16_t port ) noexcept -> std::expected<void, error_t>;
+
+	/**
+	 * @brief listen for connections
+	 * @param fd socket file descriptor
+	 * @param backlog connection queue size
+	 * @return void or error
+	 */
+	[[nodiscard]] auto listen( socket_t fd, int backlog ) noexcept -> std::expected<void, error_t>;
+
+	/**
+	 * @brief accept incoming connection
+	 * @param fd socket file descriptor
+	 * @param ip client IP address (output)
+	 * @param port client port (output)
+	 * @return client socket or error
+	 */
+	[[nodiscard]] auto accept( socket_t fd, std::array<char, 46>& ip, uint16_t& port ) noexcept
+		-> std::expected<socket_wrapper_t, error_t>;
+
+	/**
+	 * @brief check if last error was would-block
+	 * @return true if operation would block
+	 */
+	[[nodiscard]] constexpr auto would_block( ) noexcept -> bool
+	{
 #ifdef _WIN32
-    return WSAGetLastError() == WSAEWOULDBLOCK;
+		return WSAGetLastError( ) == WSAEWOULDBLOCK;
 #else
-    return errno == EAGAIN || errno == EWOULDBLOCK;
+		return errno == EAGAIN || errno == EWOULDBLOCK;
 #endif
-}
+	}
 
 } // namespace net
