@@ -1,7 +1,5 @@
 #pragma once
 
-#include "protected_functions.hpp"
-
 #ifdef _WIN32
 #include "syscalls.hpp"
 #include <windows.h>
@@ -13,6 +11,12 @@
 #include <cstring>
 #include <string_view>
 #include <span>
+
+/*
+   macro for server-side function definitions
+*/
+#define PROTECTED_FUNCTION_SERVER
+#define MARKER_DEF( RetType, Name ) static auto Name
 
 namespace client_protected
 {

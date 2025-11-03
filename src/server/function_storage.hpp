@@ -1,7 +1,5 @@
 #pragma once
 
-#define PROTECTED_FUNCTION_SERVER
-#include "protected_functions.hpp"
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
