@@ -1,7 +1,6 @@
 #pragma once
 
-#define PROTECTED_FUNCTION_SERVER
-#include "protected_function.hpp"
+#include <cstdint>
 #include <unordered_map>
 #include <vector>
 #include <span>
@@ -10,6 +9,7 @@
 #include <iostream>
 #include <sstream>
 #include <optional>
+#include <string>
 
 namespace fs = std::filesystem;
 

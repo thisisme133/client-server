@@ -2,7 +2,6 @@
 #include "packet.hpp"
 #include "crypto.hpp"
 #include "compression.hpp"
-#include "protected_function.hpp"
 
 #ifdef _WIN32
 #include "syscalls.hpp"
@@ -10,6 +9,7 @@
 #include <tlhelp32.h>
 #else
 #include <unistd.h>
+#include <sys/mman.h>
 #endif
 
 #include <array>
@@ -20,22 +20,247 @@
 #include <iostream>
 #include <ranges>
 #include <algorithm>
+#include <mutex>
+#include <condition_variable>
+#include <unordered_map>
+#include <memory>
 
 using namespace std::chrono_literals;
 
-namespace client {
+namespace client
+{
+	/*
+	   client-side protection system (bytecode storage and execution)
+	*/
 
-inline constexpr std::string_view SERVER_IP = "127.0.0.1";
-inline constexpr uint16_t SERVER_PORT = 8888;
-inline constexpr auto CHALLENGE_TIMEOUT = 5s;
-inline constexpr auto HEARTBEAT_INTERVAL = 30s;
-inline constexpr auto HEARTBEAT_TIMEOUT = 60s;
-inline constexpr auto RECONNECT_BASE_DELAY = 1s;
-inline constexpr uint32_t MAX_RECONNECT_ATTEMPTS = 10;
+	/**
+	 * @brief simple checksum for bytecode integrity
+	 * @param data bytecode data
+	 * @return checksum value
+	 */
+	inline constexpr auto simple_checksum( std::span<const uint8_t> data ) noexcept -> uint32_t
+	{
+		uint32_t checksum{ 0x5A5A5A5A };
+		for ( size_t i{ 0 }; i < data.size( ); ++i )
+		{
+			checksum ^= data[i];
+			checksum = ( checksum << 7 ) | ( checksum >> 25 );
+			checksum += i * 0x01000193;
+		}
+		return checksum;
+	}
 
-// TODO: Add configurable server list (fallback servers)
+	/**
+	 * @brief bytecode storage with integrity verification
+	 */
+	class bytecode_storage_t
+	{
+		struct bytecode_entry_t
+		{
+			std::string name{ };
+			std::vector<uint8_t> code{ };
+			uint32_t checksum{ };
+			size_t expected_size{ };
+		};
 
-class GameClient : public protect::FunctionRequester {
+		std::unordered_map<uint32_t, bytecode_entry_t> m_storage{ };
+		std::mutex m_mutex{ };
+
+		bytecode_storage_t( ) = default;
+
+	public:
+		static auto instance( ) -> bytecode_storage_t&
+		{
+			static bytecode_storage_t storage{ };
+			return storage;
+		}
+
+		auto store( uint32_t marker_hash, std::string_view name, std::span<const uint8_t> code ) -> bool
+		{
+			std::lock_guard lock{ m_mutex };
+
+			auto it{ m_storage.find( marker_hash ) };
+			if ( it != m_storage.end( ) && it->second.name != name )
+			{
+				return false;
+			}
+
+			bytecode_entry_t entry{ };
+			entry.name = std::string( name );
+			entry.code = std::vector<uint8_t>( code.begin( ), code.end( ) );
+			entry.checksum = simple_checksum( code );
+			entry.expected_size = code.size( );
+
+			m_storage[marker_hash] = std::move( entry );
+			return true;
+		}
+
+		auto get( uint32_t marker_hash, std::string_view expected_name ) -> std::vector<uint8_t>
+		{
+			std::lock_guard lock{ m_mutex };
+			auto it{ m_storage.find( marker_hash ) };
+
+			if ( it == m_storage.end( ) )
+			{
+				return { };
+			}
+
+			auto& entry{ it->second };
+
+			if ( entry.name != expected_name )
+			{
+				return { };
+			}
+
+			uint32_t actual_checksum{ simple_checksum( entry.code ) };
+			if ( actual_checksum != entry.checksum )
+			{
+				m_storage.erase( it );
+				return { };
+			}
+
+			if ( entry.code.size( ) != entry.expected_size )
+			{
+				m_storage.erase( it );
+				return { };
+			}
+
+			return entry.code;
+		}
+
+		auto has( uint32_t marker_hash, std::string_view expected_name ) -> bool
+		{
+			std::lock_guard lock{ m_mutex };
+			auto it{ m_storage.find( marker_hash ) };
+			return it != m_storage.end( ) && it->second.name == expected_name;
+		}
+
+		auto clear( ) -> void
+		{
+			std::lock_guard lock{ m_mutex };
+			m_storage.clear( );
+		}
+	};
+
+	/**
+	 * @brief pending function requests manager
+	 */
+	class pending_requests_t
+	{
+		struct request_t
+		{
+			uint32_t marker_hash{ };
+			std::mutex mutex{ };
+			std::condition_variable cv{ };
+			bool completed{ false };
+		};
+
+		std::unordered_map<uint32_t, std::shared_ptr<request_t>> m_requests{ };
+		std::mutex m_mutex{ };
+
+		pending_requests_t( ) = default;
+
+	public:
+		static auto instance( ) -> pending_requests_t&
+		{
+			static pending_requests_t pending{ };
+			return pending;
+		}
+
+		auto add( uint32_t marker_hash ) -> std::shared_ptr<request_t>
+		{
+			std::lock_guard lock{ m_mutex };
+			auto req{ std::make_shared<request_t>( ) };
+			req->marker_hash = marker_hash;
+			m_requests[marker_hash] = req;
+			return req;
+		}
+
+		auto complete( uint32_t marker_hash ) -> void
+		{
+			std::shared_ptr<request_t> req{ };
+			{
+				std::lock_guard lock{ m_mutex };
+				auto it{ m_requests.find( marker_hash ) };
+				if ( it != m_requests.end( ) )
+				{
+					req = it->second;
+					m_requests.erase( it );
+				}
+			}
+
+			if ( req )
+			{
+				std::lock_guard lock{ req->mutex };
+				req->completed = true;
+				req->cv.notify_all( );
+			}
+		}
+
+		auto remove( uint32_t marker_hash ) -> void
+		{
+			std::lock_guard lock{ m_mutex };
+			m_requests.erase( marker_hash );
+		}
+
+		auto wait_for( uint32_t marker_hash, std::chrono::milliseconds timeout ) -> bool
+		{
+			std::shared_ptr<request_t> req{ };
+			{
+				std::lock_guard lock{ m_mutex };
+				auto it{ m_requests.find( marker_hash ) };
+				if ( it != m_requests.end( ) )
+				{
+					req = it->second;
+				}
+			}
+
+			if ( !req ) return false;
+
+			std::unique_lock lock{ req->mutex };
+			bool success{ req->cv.wait_for( lock, timeout, [&] { return req->completed; } ) };
+
+			{
+				std::lock_guard map_lock{ m_mutex };
+				auto it{ m_requests.find( marker_hash ) };
+				if ( it != m_requests.end( ) && !it->second->completed )
+				{
+					m_requests.erase( it );
+				}
+			}
+
+			return success;
+		}
+	};
+
+	/**
+	 * @brief function requester interface
+	 */
+	class function_requester_t
+	{
+	public:
+		virtual ~function_requester_t( ) = default;
+		virtual auto request_function( uint32_t marker_hash ) -> bool = 0;
+	};
+
+	/*
+	   client constants
+	*/
+	inline constexpr std::string_view SERVER_IP{ "127.0.0.1" };
+	inline constexpr uint16_t SERVER_PORT{ 8888 };
+	inline constexpr auto CHALLENGE_TIMEOUT{ 5s };
+	inline constexpr auto HEARTBEAT_INTERVAL{ 30s };
+	inline constexpr auto HEARTBEAT_TIMEOUT{ 60s };
+	inline constexpr auto RECONNECT_BASE_DELAY{ 1s };
+	inline constexpr uint32_t MAX_RECONNECT_ATTEMPTS{ 10 };
+
+	// TODO: Add configurable server list (fallback servers)
+
+	/**
+	 * @brief game client implementation
+	 */
+	class game_client_t : public function_requester_t
+	{
     net::Socket socket_;
     bool authenticated_ = false;
     std::array<uint8_t, proto::SESSION_KEY_SIZE> session_key_{};
@@ -387,7 +612,7 @@ private:
     }
 
     void handle_function_response(const proto::PayloadFunctionResponse& payload) {
-        auto& storage = protect::BytecodeStorage::instance();
+        auto& storage = bytecode_storage_t::instance();
 
         // Extract function name (null-terminated)
         std::string_view function_name(payload.function_name.data());
@@ -395,7 +620,7 @@ private:
         // Verify checksum BEFORE storing
         std::span<const uint8_t> code{payload.code.data(), payload.code_size};
         uint32_t received_checksum = payload.checksum;
-        uint32_t computed_checksum = protect::simple_checksum(code);
+        uint32_t computed_checksum = simple_checksum(code);
 
         if (received_checksum != computed_checksum) {
             // Checksum mismatch - possible network corruption or MITM attack
@@ -411,7 +636,7 @@ private:
         }
 
         // Notify pending request
-        protect::PendingRequests::instance().complete(payload.marker_hash);
+        pending_requests_t::instance().complete(payload.marker_hash);
     }
 
 #ifdef _WIN32
@@ -564,12 +789,10 @@ int main() {
         return 1;
     }
 
-    client::GameClient client;
+    client::game_client_t client{ };
 
-    // Set up protected function system
-    protect::FnProtectGlobal::set_requester(&client);
-
-    if (auto result = client.connect(); !result) {
+    if ( auto result{ client.connect( ) }; !result )
+    {
         return 1;
     }
 
